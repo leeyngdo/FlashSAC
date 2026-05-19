@@ -20,8 +20,10 @@ class MjlabVectorEnv(VectorEnv[F32NDArray, F32NDArray, F32NDArray]):
     IsaacLab wrapper where terminal obs is unavailable.
 
     Observations are flattened from mjlab's dict format:
-    - If both "actor" and "critic" groups exist: concatenated as [actor | critic],
-      with env_info["actor_observation_size"] set so FlashSAC's agent can split them.
+    - If both "actor" and "critic" groups exist: critic obs is stored (critic is a
+      superset of actor obs). env_info["actor_observation_size"] is always set so
+      FlashSAC's agent slices obs[:actor_dim] for the actor and obs for the critic.
+      This halves buffer memory vs the previous [actor | critic] concatenation.
     - Otherwise: the single group is used as-is.
 
     Actions are passed through unchanged (mjlab action terms handle scaling internally).
@@ -51,11 +53,10 @@ class MjlabVectorEnv(VectorEnv[F32NDArray, F32NDArray, F32NDArray]):
 
         # Determine obs layout
         obs_groups = list(self._env.single_observation_space.spaces.keys())
-        self._has_asymmetric = "actor" in obs_groups and "critic" in obs_groups
+        self._has_critic_obs = "actor" in obs_groups and "critic" in obs_groups
         self._actor_obs_dim = int(self._env.single_observation_space.spaces["actor"].shape[0])
-        if self._has_asymmetric:
-            critic_dim = int(self._env.single_observation_space.spaces["critic"].shape[0])
-            flat_dim = self._actor_obs_dim + critic_dim
+        if self._has_critic_obs:
+            flat_dim = int(self._env.single_observation_space.spaces["critic"].shape[0])
         else:
             flat_dim = self._actor_obs_dim
 
@@ -73,11 +74,21 @@ class MjlabVectorEnv(VectorEnv[F32NDArray, F32NDArray, F32NDArray]):
         # Episode return/length tracking for training-time logging
         self._ep_returns = np.zeros(num_envs, dtype=np.float32)
         self._ep_lengths = np.zeros(num_envs, dtype=np.int32)
+        self._obs_prefix_checked = False
 
     def _flatten_obs(self, obs_dict: dict[str, Any]) -> F32NDArray:
-        actor = obs_dict["actor"]
-        flat = torch.cat([actor, obs_dict["critic"]], dim=-1) if self._has_asymmetric else actor
+        flat = obs_dict["critic"] if self._has_critic_obs else obs_dict["actor"]
         return flat.cpu().numpy().astype(np.float32)
+
+    def _check_obs_prefix(self, obs_dict: dict[str, Any]) -> None:
+        """Assert critic_obs[:actor_dim] == actor_obs (critic must be a superset)."""
+        actor = obs_dict["actor"].float()
+        critic = obs_dict["critic"].float()
+        err = ((actor - critic[:, : self._actor_obs_dim]) ** 2).sum().item()
+        assert err < 1e-6, (
+            f"critic_obs[:actor_dim] != actor_obs (err={err:.2e}). "
+            "Critic obs must contain actor obs as a prefix for single-buffer storage."
+        )
 
     def reset(
         self,
@@ -88,8 +99,11 @@ class MjlabVectorEnv(VectorEnv[F32NDArray, F32NDArray, F32NDArray]):
         obs_dict, _ = self._env.reset()
         self._ep_returns[:] = 0.0
         self._ep_lengths[:] = 0
+        if self._has_critic_obs and not self._obs_prefix_checked:
+            self._check_obs_prefix(obs_dict)
+            self._obs_prefix_checked = True
         env_info: dict[str, Any] = {}
-        if self._has_asymmetric:
+        if self._has_critic_obs:
             env_info["actor_observation_size"] = (self._actor_obs_dim,)
         return self._flatten_obs(obs_dict), env_info
 
@@ -130,8 +144,7 @@ class MjlabVectorEnv(VectorEnv[F32NDArray, F32NDArray, F32NDArray]):
         done_ids_np = done_ids.cpu().numpy()
         raw_log = extras.get("log") or {}
         episode_info: dict[str, Any] = {
-            k: float(v.mean().item()) if isinstance(v, torch.Tensor) else v
-            for k, v in raw_log.items()
+            k: float(v.mean().item()) if isinstance(v, torch.Tensor) else v for k, v in raw_log.items()
         }
         if len(done_ids_np) > 0:
             episode_info["episode_rewards"] = float(self._ep_returns[done_ids_np].mean())
@@ -153,7 +166,6 @@ class MjlabVectorEnv(VectorEnv[F32NDArray, F32NDArray, F32NDArray]):
         if hasattr(self, "_env"):
             self._env.close()
 
-
     @classmethod
     def from_env(
         cls,
@@ -174,13 +186,10 @@ class MjlabVectorEnv(VectorEnv[F32NDArray, F32NDArray, F32NDArray]):
         instance.num_envs = env.num_envs
 
         obs_groups = list(env.single_observation_space.spaces.keys())
-        instance._has_asymmetric = "actor" in obs_groups and "critic" in obs_groups
-        instance._actor_obs_dim = int(
-            env.single_observation_space.spaces["actor"].shape[0]
-        )
-        if instance._has_asymmetric:
-            critic_dim = int(env.single_observation_space.spaces["critic"].shape[0])
-            flat_dim = instance._actor_obs_dim + critic_dim
+        instance._has_critic_obs = "actor" in obs_groups and "critic" in obs_groups
+        instance._actor_obs_dim = int(env.single_observation_space.spaces["actor"].shape[0])
+        if instance._has_critic_obs:
+            flat_dim = int(env.single_observation_space.spaces["critic"].shape[0])
         else:
             flat_dim = instance._actor_obs_dim
 
@@ -189,20 +198,15 @@ class MjlabVectorEnv(VectorEnv[F32NDArray, F32NDArray, F32NDArray]):
         instance.single_observation_space = gym.spaces.Box(
             low=-np.inf, high=np.inf, shape=(flat_dim,), dtype=np.float32
         )
-        instance.observation_space = batch_space(
-            instance.single_observation_space, env.num_envs
-        )
-        instance.single_action_space = gym.spaces.Box(
-            low=-np.inf, high=np.inf, shape=(action_dim,), dtype=np.float32
-        )
-        instance.action_space = batch_space(
-            instance.single_action_space, env.num_envs
-        )
+        instance.observation_space = batch_space(instance.single_observation_space, env.num_envs)
+        instance.single_action_space = gym.spaces.Box(low=-np.inf, high=np.inf, shape=(action_dim,), dtype=np.float32)
+        instance.action_space = batch_space(instance.single_action_space, env.num_envs)
 
         instance.obs_size = (flat_dim,)
         instance.action_size = (action_dim,)
         instance._ep_returns = np.zeros(env.num_envs, dtype=np.float32)
         instance._ep_lengths = np.zeros(env.num_envs, dtype=np.int32)
+        instance._obs_prefix_checked = False
 
         return instance
 
