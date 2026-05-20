@@ -39,7 +39,6 @@ class FlashSACConfig:
     buffer_max_length: int
     buffer_min_length: int
     buffer_device_type: str
-    buffer_obs_dtype: Optional[str] = None
     sample_batch_size: int
 
     learning_rate_init: float
@@ -77,6 +76,8 @@ class FlashSACConfig:
 
     load_optimizer: bool
     load_reward_normalizer: bool
+
+    buffer_obs_dtype: Optional[str] = None
 
 
 def _init_flashsac_networks(
