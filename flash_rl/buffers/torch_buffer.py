@@ -175,17 +175,20 @@ class TorchUniformBuffer(BaseBuffer):
         else:
             idxs = torch.as_tensor(sample_idxs, device=self._device)
 
+        if self._obs_storage_dtype is not None:
+            obs = self._observations.to(torch.float32)[idxs]
+            next_obs = self._next_observations.to(torch.float32)[idxs]
+        else:
+            obs = self._observations[idxs]
+            next_obs = self._next_observations[idxs]
+
         batch: Batch = {}
-        batch["observation"] = self._observations[idxs]
+        batch["observation"] = obs
         batch["action"] = self._actions[idxs]
         batch["reward"] = self._rewards[idxs]
         batch["terminated"] = self._terminateds[idxs]
         batch["truncated"] = self._truncateds[idxs]
-        batch["next_observation"] = self._next_observations[idxs]
-
-        if self._obs_storage_dtype is not None:
-            batch["observation"] = cast(torch.Tensor, batch["observation"]).to(torch.float32)
-            batch["next_observation"] = cast(torch.Tensor, batch["next_observation"]).to(torch.float32)
+        batch["next_observation"] = next_obs
 
         return batch
 
