@@ -39,7 +39,7 @@ class FlashSACConfig:
     buffer_max_length: int
     buffer_min_length: int
     buffer_device_type: str
-    buffer_obs_dtype: Optional[str]
+    buffer_obs_dtype: Optional[str] = None
     sample_batch_size: int
 
     learning_rate_init: float
