@@ -1,4 +1,5 @@
 from collections.abc import Callable
+from functools import partial
 from importlib import import_module
 from typing import Any, Union, cast
 
@@ -121,11 +122,13 @@ class IsaacLabVectorEnv(
         self.envs = gym.make(env_name, cfg=env_cfg, render_mode=None)
         setattr(cast(Any, self.envs.unwrapped), "eval_mode", False)
 
-        # Capture terminal observations before IsaacLab's same-step autoreset.
         self._final_obs_buf: dict[str, torch.Tensor] | None = None
         _base_env = cast(Any, self.envs.unwrapped)
         if hasattr(_base_env, "_reset_idx") and hasattr(_base_env, "observation_manager"):
-            self._patch_reset_idx_for_final_obs(_base_env)
+            # IsaacLab resets done envs inside step() and recomputes observations afterwards, so the
+            # returned obs for a done env is already the post-reset frame. _reset_idx is the last point
+            # where the sim still holds the terminal state; cache it for infos["final_obs"].
+            _base_env._reset_idx = partial(self._reset_idx_with_final_obs, _base_env, _base_env._reset_idx)
 
         self.num_envs = cast(Any, self.envs.unwrapped).num_envs
         self.max_episode_steps = cast(Any, self.envs.unwrapped).max_episode_length
@@ -172,28 +175,22 @@ class IsaacLabVectorEnv(
     def set_eval_mode(self, eval_mode: bool) -> None:
         setattr(cast(Any, self.envs.unwrapped), "eval_mode", eval_mode)
 
-    def _patch_reset_idx_for_final_obs(self, base_env: Any) -> None:
-        """Hook ``base_env._reset_idx`` to snapshot the true terminal observation before auto-reset.
-
-        IsaacLab resets done envs inside ``step()`` and recomputes observations afterwards, so the
-        returned obs for a done env is already the post-reset frame. ``_reset_idx`` is the last point
-        where the sim still holds the terminal state (it runs scene/event/command resets internally),
-        so we compute observations here and cache the rows for the resetting envs into
-        ``self._final_obs_buf``. ``step()`` then exposes this as the (genuine) ``infos["final_obs"]``.
-        """
-        orig_reset_idx = base_env._reset_idx
-
-        def patched_reset_idx(env_ids: Any, *args: Any, **kwargs: Any) -> Any:
-            if env_ids is None:
-                env_ids = slice(None)
-            terminal = base_env.observation_manager.compute()
-            if self._final_obs_buf is None:
-                self._final_obs_buf = {k: torch.zeros_like(v) for k, v in terminal.items()}
-            for k, v in terminal.items():
-                self._final_obs_buf[k][env_ids] = v[env_ids]
-            return orig_reset_idx(env_ids, *args, **kwargs)
-
-        base_env._reset_idx = patched_reset_idx
+    def _reset_idx_with_final_obs(
+        self,
+        base_env: Any,
+        orig_reset_idx: Callable[..., Any],
+        env_ids: Any,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        if env_ids is None:
+            env_ids = slice(None)
+        terminal = base_env.observation_manager.compute()
+        if self._final_obs_buf is None:
+            self._final_obs_buf = {k: torch.zeros_like(v) for k, v in terminal.items()}
+        for k, v in terminal.items():
+            self._final_obs_buf[k][env_ids] = v[env_ids]
+        return orig_reset_idx(env_ids, *args, **kwargs)
 
     def _build_joint_limit_bound(self, fraction: float, mode: str) -> tuple[torch.Tensor, torch.Tensor]:
         """Build the per-joint (bias, range) affine from the live robot joint limits + action scale.
