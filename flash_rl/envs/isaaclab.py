@@ -184,6 +184,8 @@ class IsaacLabVectorEnv(
         orig_reset_idx = base_env._reset_idx
 
         def patched_reset_idx(env_ids: Any, *args: Any, **kwargs: Any) -> Any:
+            if env_ids is None:
+                env_ids = slice(None)
             terminal = base_env.observation_manager.compute()
             if self._final_obs_buf is None:
                 self._final_obs_buf = {k: torch.zeros_like(v) for k, v in terminal.items()}

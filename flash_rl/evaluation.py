@@ -87,9 +87,9 @@ def evaluate(
         "avg_success_end": float(np.mean(total_success_end_list)),
     }
 
-    env.reset()
     if callable(eval_mode):
         eval_mode(False)
+    env.reset()
 
     return eval_info
 
@@ -154,8 +154,8 @@ def record_video(
 
     video_info = {"video": total_videos}
 
-    env.reset()
     if callable(eval_mode):
         eval_mode(False)
+    env.reset()
 
     return video_info
