@@ -21,13 +21,11 @@ from flash_rl.types import Tensor
 
 
 def play(args: argparse.Namespace) -> None:
-    # Load config (same as train.py)
     OmegaConf.register_new_resolver("eval", lambda s: eval(s))
     hydra.initialize(version_base=None, config_path=args.config_path)
     cfg = hydra.compose(config_name=args.config_name, overrides=args.overrides)
     OmegaConf.resolve(cfg)
 
-    # Seeding
     random.seed(cfg.seed)
     np.random.seed(cfg.seed)
     torch.manual_seed(cfg.seed)
@@ -39,7 +37,6 @@ def play(args: argparse.Namespace) -> None:
         torch.set_float32_matmul_precision("high")
 
     record = args.video
-    # When recording we run headless with offscreen cameras enabled so the viewport renders without a GUI.
     env = make_isaaclab_env(
         env_name=cfg.env.env_name,
         num_envs=args.num_envs,
@@ -55,7 +52,6 @@ def play(args: argparse.Namespace) -> None:
         action_bound=cfg.env.get("action_bound", None),
     )
 
-    # Create agent using config (same as train.py)
     _, env_info = env.reset(random_start_init=False)
     agent = create_agent(
         observation_space=env.observation_space,
@@ -65,7 +61,7 @@ def play(args: argparse.Namespace) -> None:
     )
     agent.load(args.checkpoint_path)
 
-    base_env = env.envs.unwrapped  # underlying IsaacLab ManagerBasedRLEnv (sim / scene / step_dt)
+    base_env = env.envs.unwrapped
 
     recorder: Optional[VideoRecorder] = None
     if record:
@@ -74,20 +70,17 @@ def play(args: argparse.Namespace) -> None:
         out_path = args.video_path or os.path.join(args.checkpoint_path, "play_video.mp4")
         recorder = VideoRecorder(out_path, resolution=RESOLUTION_MAP[args.resolution], fps=fps)
         recorder.initialize()
-        # Position the persp camera to overview the scene.
         origins = base_env.scene.env_origins.cpu().numpy()
         center = origins.mean(axis=0)
         eye = center + (np.array(args.cam_eye) if args.cam_eye else np.array([5.0, 5.0, 4.0]))
         target = center + (np.array(args.cam_target) if args.cam_target else np.array([0.0, 0.0, 0.6]))
         base_env.sim.set_camera_view(eye=tuple(eye), target=tuple(target))
-        # Ensure the reference-motion sphere markers are drawn into the offscreen recording.
         try:
             base_env.command_manager.set_debug_vis(True)
         except Exception as e:  # pragma: no cover - depends on live env
             print(f"[WARNING] could not enable command debug_vis: {e}")
         print(f"[INFO] Camera eye={eye.tolist()}, target={target.tolist()}; recording {args.video_length} steps")
 
-    # Play loop
     observations, _ = env.reset(random_start_init=False)
     prev_transition: MutableMapping[str, Tensor] = {"next_observation": observations}
     completed_episodes = 0
@@ -101,7 +94,7 @@ def play(args: argparse.Namespace) -> None:
         step += 1
 
         if recorder is not None:
-            base_env.sim.render()  # force a viewport render for headless capture
+            base_env.sim.render()
             if step % args.video_interval == 0:
                 recorder.capture_frame()
 
@@ -125,8 +118,7 @@ def play(args: argparse.Namespace) -> None:
     if recorder is not None:
         recorder.save()
     env.close()
-    # IsaacSim's kit shutdown frequently hangs, leaving the process alive and holding GPU memory.
-    # This is a one-shot play/record script, so hard-exit to guarantee the GPU is released.
+    # IsaacSim shutdown can hang and keep GPU memory alive in this one-shot script.
     try:
         env.simulation_app.close()
     except Exception:

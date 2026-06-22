@@ -160,11 +160,12 @@ def run(args: argparse.Namespace) -> None:
                 update_counter -= 1
 
             # evaluation
-            reset_shared_rollout = False
             if cfg.evaluation_per_interaction_step and interaction_step % cfg.evaluation_per_interaction_step == 0:
                 eval_info = evaluate(agent, eval_env, cfg.num_eval_episodes, cfg.env.env_type)
                 logger.update_metric(**eval_info)
-                reset_shared_rollout = reset_shared_rollout or eval_env is train_env
+                if eval_env is train_env:
+                    observations, _ = train_env.reset()
+                    transition = {"next_observation": observations}
 
             # metrics
             if cfg.metrics_per_interaction_step and interaction_step % cfg.metrics_per_interaction_step == 0:
@@ -175,11 +176,9 @@ def run(args: argparse.Namespace) -> None:
             if cfg.recording_per_interaction_step and interaction_step % cfg.recording_per_interaction_step == 0:
                 video_info = record_video(agent, record_env, cfg.num_record_episodes, cfg.env.env_type)
                 logger.update_metric(**video_info)
-                reset_shared_rollout = reset_shared_rollout or (cfg.num_record_episodes > 0 and record_env is train_env)
-
-            if reset_shared_rollout:
-                observations, _ = train_env.reset()
-                transition = {"next_observation": observations}
+                if cfg.num_record_episodes > 0 and record_env is train_env:
+                    observations, _ = train_env.reset()
+                    transition = {"next_observation": observations}
 
             # logging
             if cfg.logging_per_interaction_step and interaction_step % cfg.logging_per_interaction_step == 0:

@@ -12,7 +12,7 @@ from ..types import F32NDArray, NDArray
 from .isaaclab_envs.tracking.overrides import apply_tracking_overrides, omegaconf_to_plain
 from .isaaclab_envs.utils.action_bounds import compute_joint_limit_action_bound
 
-# NOTE: There is no way to get the action bounds from the env, so we hardcode them here following FastTD3
+# IsaacLab does not expose these bounds directly.
 ACTION_BOUNDS = {
     "Isaac-Repose-Cube-Shadow-Direct-v0": 1.0,
     "Isaac-Repose-Cube-Allegro-Direct-v0": 1.0,
@@ -26,7 +26,6 @@ ACTION_BOUNDS = {
     "Isaac-Velocity-Rough-Anymal-C-v0": 1.0,
     "Isaac-Velocity-Flat-Anymal-D-v0": 1.0,
     "Isaac-Velocity-Rough-Anymal-D-v0": 1.0,
-    # NOTE: tanh-squashed action in [-1, 1] is scaled by env_cfg.actions.joint_pos.scale = G1_ACTION_SCALE in the env.
     "Isaac-Tracking-Flat-G1-v0": 1.0,
     "Isaac-Tracking-Flat-G1-WoSE-v0": 1.0,
 }
@@ -87,9 +86,7 @@ class IsaacLabVectorEnv(
 
         is_tracking = env_name.startswith("Isaac-Tracking")
         if is_tracking:
-            # NOTE: Registration must happen AFTER AppLauncher (so isaaclab is importable) and BEFORE parse_env_cfg
-            # (which needs the task registered to look up its env_cfg_entry_point). The package __init__ stays
-            # import-light; importing the g1 config module triggers the gym.register calls.
+            # Register local tracking tasks after AppLauncher initializes IsaacLab.
             import flash_rl.envs.isaaclab_envs.tracking.config.g1  # noqa: F401
 
         from isaaclab_tasks.utils.parse_cfg import parse_env_cfg
@@ -104,7 +101,6 @@ class IsaacLabVectorEnv(
         self.device = device
 
         if is_tracking:
-            # Convert any OmegaConf containers to plain Python, then apply the full override stack before gym.make.
             apply_tracking_overrides(
                 env_cfg,
                 reward=omegaconf_to_plain(reward),
@@ -118,12 +114,7 @@ class IsaacLabVectorEnv(
         self.envs = gym.make(env_name, cfg=env_cfg, render_mode=None)
         setattr(cast(Any, self.envs.unwrapped), "is_evaluating", False)
 
-        # True terminal-observation capture for off-policy value bootstrapping.
-        # IsaacLab auto-resets done envs *inside* step() and recomputes observations, so the obs it
-        # returns for a done env is the POST-reset frame. For timeout (truncation) transitions the
-        # critic must bootstrap on the genuine terminal obs, not a different episode's reset frame.
-        # We hook the underlying env's `_reset_idx` to snapshot observations while the sim still holds
-        # the terminal state (before scene/command resets run), and surface it as infos["final_obs"].
+        # Capture terminal observations before IsaacLab's same-step autoreset.
         self._final_obs_buf: dict[str, torch.Tensor] | None = None
         _base_env = cast(Any, self.envs.unwrapped)
         if hasattr(_base_env, "_reset_idx") and hasattr(_base_env, "observation_manager"):
@@ -133,16 +124,11 @@ class IsaacLabVectorEnv(
         self.max_episode_steps = cast(Any, self.envs.unwrapped).max_episode_length
         self.to_numpy = to_numpy
 
-        # Get observation/action spaces
-        # NOTE: Action range: [-1, 1] * action_bounds (https://github.com/google-deepmind/mujoco_playground/issues/19)
         obs_space = cast(Any, self.envs.unwrapped).single_observation_space
         self.obs_size = obs_space["policy"].shape
         self.asymmetric_obs = isinstance(obs_space, gym.spaces.Dict) and "critic" in obs_space.spaces
         if self.asymmetric_obs:
-            # NOTE: Env will treat concatenate actor & critic states as the observation,
-            # but will give 'actual' observation size in the info.
             self.critic_obs_size = obs_space["critic"].shape
-            # NOTE: setting to [0, 0] since we only need the shape and dtype
             self.single_observation_space = gym.spaces.Box(
                 low=0.0, high=0.0, shape=(self.obs_size[-1] + self.critic_obs_size[-1],), dtype=np.float32
             )
@@ -153,10 +139,6 @@ class IsaacLabVectorEnv(
             self.observation_space = batch_space(self.single_observation_space, self.num_envs)
 
         self.action_size = cast(Any, self.envs.unwrapped).single_action_space.shape
-        # Action-bound policy: scalar (default, back-compat) OR per-joint joint-limit affine.
-        # In joint-limit mode the actor still emits tanh in [-1, 1] (so single_action_space stays
-        # [-1, 1] and the replay buffer / random-init are unchanged); the per-joint window is applied
-        # in step() via final = bias + range * clamp(action, -1, 1).
         self._action_bias: torch.Tensor | None = None
         self._action_range: torch.Tensor | None = None
         action_bound = omegaconf_to_plain(action_bound)
@@ -246,13 +228,7 @@ class IsaacLabVectorEnv(
             obs = torch.cat((obs, critic_obs), dim=-1)
         else:
             critic_obs = None
-        # NOTE: decorrelate episode horizons like RSL‑RL
-        # In IsaacLab, `dones` is computed as follows:
-        # `time_out = self.episode_length_buf >= self.max_episode_length - 1`
-        # While training, this code spreads out the resets to avoid spikes
-        # when many environments reset at a similar time.
         if random_start_init:
-            # step in current episode (per env)
             cast(Any, self.envs.unwrapped).episode_length_buf = torch.randint_like(
                 cast(Any, self.envs.unwrapped).episode_length_buf, high=int(self.max_episode_steps)
             )
@@ -277,7 +253,6 @@ class IsaacLabVectorEnv(
             torch_actions = torch.from_numpy(actions).to(self.device)
 
         if self._action_bias is not None:
-            # Per-joint joint-limit affine: map tanh action in [-1, 1] onto the per-joint window.
             torch_actions = self._action_bias + self._action_range * torch.clamp(torch_actions, -1.0, 1.0)
         elif self.action_bounds is not None:
             torch_actions = torch.clamp(torch_actions, -1.0, 1.0) * self.action_bounds
@@ -289,10 +264,6 @@ class IsaacLabVectorEnv(
         else:
             critic_obs = None
         infos = {"time_outs": truncations, "observations": {"critic": critic_obs}}
-        # True terminal observation (captured pre-reset in _install_terminal_obs_capture). Rows for
-        # envs that reset this step are fresh; other rows are stale but never read (train.py consumes
-        # final_obs only for done envs). Falls back to post-reset obs before the first reset occurs.
-        # See https://github.com/isaac-sim/IsaacLab/issues/1362
         if self._final_obs_buf is not None:
             final_obs = self._final_obs_buf["policy"]
             if self.asymmetric_obs:
@@ -301,12 +272,6 @@ class IsaacLabVectorEnv(
         else:
             infos["final_obs"] = obs
 
-        # Surface IsaacLab's per-term episodic logs so each reward is logged separately.
-        # IsaacLab's managers populate raw_infos["log"] on reset with keys like
-        # "Episode_Reward/<term>" (episodic sum / max_episode_length_s, averaged over the envs that
-        # reset this step), "Episode_Termination/<term>", and command "Metrics/...". We remap reward
-        # terms -> "rewards/<term>" and termination terms -> "terminations/<term>" (others pass
-        # through) and only emit on steps where an env actually reset (so values are fresh).
         log = raw_infos.get("log") if isinstance(raw_infos, dict) else None
         if log and bool(terminations.any()) | bool(truncations.any()):
             episode_info: dict[str, float] = {}
@@ -332,8 +297,6 @@ class IsaacLabVectorEnv(
         return obs, rew, terminations, truncations, infos
 
     def close(self, **kwargs: Any) -> None:
-        # self.envs.close(**kwargs)
-        # self.simulation_app.close()
         return
 
     def render(self) -> None:

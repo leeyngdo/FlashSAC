@@ -1,16 +1,7 @@
 #!/bin/bash
-##################################################################################
-# IsaacLab Motion Tracking (G1, GPU Simulator)
-#
-# Reward-group sweep for the vendored BeyondMimic G1 tracking task.
-# Mirrors scripts/run_isaaclab.sh GPU recipe (num_train_envs=1024, cuda buffer,
-# batch 2048, amp) plus the tracking-specific knobs (asymmetric obs, grouped
-# reward overrides). Edit MOTION_FILES below before running.
-##################################################################################
+# IsaacLab G1 motion-tracking recipe.
 
-# REQUIRED: list of .npz motion clips OR a directory of .npz (or a single path).
-# Hydra list literal syntax: ["/path/a.npz","/path/b.npz"] or a directory "/path/motions".
-# TODO: replace the placeholder with your motion clip path(s).
+# .npz path, list, or directory.
 MOTION_FILES='[/home/ubuntu/youngdo/FlashSAC/flash_rl/envs/isaaclab_envs/motions/TODO_REPLACE_ME.npz]'
 
 seeds=( 0 1000 2000 3000 4000 )

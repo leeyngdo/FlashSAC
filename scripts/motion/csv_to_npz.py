@@ -1,27 +1,9 @@
 # ruff: noqa: E402  (IsaacLab scripts must import isaaclab.* only after AppLauncher is created)
-"""Convert a retargeted LAFAN1 CSV motion to a WBT-format ``.npz`` for the FlashSAC tracking task.
+"""Convert a retargeted LAFAN1 CSV motion to a tracking-task ``.npz``.
 
-This replays a retargeted motion CSV (root pos[3] + root quat[4, xyzw] + 29 joint angles) on the
-vendored G1 articulation in Isaac Sim and logs maximum-coordinate body states via forward kinematics,
-then saves a local ``.npz`` with the exact keys the tracking ``MotionLoader`` expects:
-``fps, joint_pos, joint_vel, body_pos_w, body_quat_w, body_lin_vel_w, body_ang_vel_w``.
-
-Adapted from HybridRobotics/whole_body_tracking ``scripts/csv_to_npz.py`` (BSD-3-Clause): swaps the
-robot cfg for FlashSAC's vendored ``G1_CYLINDER_CFG`` and replaces the WandB upload with a local save.
-
-REQUIRES Isaac Sim / Isaac Lab (this is the forward-kinematics step that cannot run without the simulator).
-
-.. code-block:: bash
-
-    # from the repo root, with the isaaclab extra installed
-    python scripts/motion/csv_to_npz.py \
-        --input_file flash_rl/envs/isaaclab_envs/motions/lafan1_csv/walk1_subject1.csv \
-        --input_fps 30 --output_fps 50 \
-        --output_name walk1_subject1 --headless
-    # -> flash_rl/envs/isaaclab_envs/motions/walk1_subject1.npz
+Adapted from HybridRobotics/whole_body_tracking ``scripts/csv_to_npz.py`` (BSD-3-Clause).
+Requires Isaac Sim / Isaac Lab for forward kinematics.
 """
-
-"""Launch Isaac Sim Simulator first."""
 
 import argparse
 import os
@@ -61,8 +43,6 @@ args_cli = parser.parse_args()
 
 app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
-
-"""Rest everything follows."""
 
 import isaaclab.sim as sim_utils
 import torch
