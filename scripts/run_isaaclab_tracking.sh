@@ -19,7 +19,6 @@ for seed in "${seeds[@]}"; do
     uv run python train.py \
         --config_name flashSAC_base \
         --overrides seed=${seed} \
-        `#=== Environment (GPU sim) ===#` \
         --overrides env=isaaclab_tracking \
         --overrides env.env_name=Isaac-Tracking-Flat-G1-v0 \
         --overrides "env.motion.motion_files=${MOTION_FILES}" \
@@ -29,7 +28,6 @@ for seed in "${seeds[@]}"; do
         --overrides num_record_envs=null \
         --overrides num_eval_episodes=1024 \
         --overrides num_record_episodes=0 \
-        `#=== Agent (GPU sim) ===#` \
         --overrides agent=flashSAC \
         --overrides agent.buffer_max_length=10_000_000 \
         --overrides agent.buffer_min_length=100_000 \
@@ -37,7 +35,6 @@ for seed in "${seeds[@]}"; do
         --overrides agent.sample_batch_size=2048 \
         --overrides agent.use_amp=true \
         --overrides updates_per_interaction_step=2 \
-        `#=== Tracking recipe ===#` \
         --overrides agent.asymmetric_observation=true \
         --overrides gamma=0.99 \
         --overrides n_step=3

@@ -14,7 +14,7 @@ REQUIRES Isaac Sim / Isaac Lab (this is the forward-kinematics step that cannot 
 .. code-block:: bash
 
     # from the repo root, with the isaaclab extra installed
-    python scripts/csv_to_npz.py \
+    python scripts/motion/csv_to_npz.py \
         --input_file flash_rl/envs/isaaclab_envs/motions/lafan1_csv/walk1_subject1.csv \
         --input_fps 30 --output_fps 50 \
         --output_name walk1_subject1 --headless
@@ -30,7 +30,7 @@ import numpy as np
 from isaaclab.app import AppLauncher
 
 _DEFAULT_OUTPUT_DIR = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
     "flash_rl",
     "envs",
     "isaaclab_envs",

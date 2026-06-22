@@ -224,7 +224,7 @@ Key arguments:
 FlashSAC vendors the [BeyondMimic](https://beyondmimic.github.io/) G1 whole-body motion-tracking task in a **KraftonLab-style modular layout** under `flash_rl/envs/isaaclab_envs/`. It registers the gym ids `Isaac-Tracking-Flat-G1-v0` (with state estimation) and `Isaac-Tracking-Flat-G1-WoSE-v0` (without state estimation), trained with the **holosoma FastSAC reward preset** as the default.
 
 > [!IMPORTANT]
-> `env.motion.motion_files` is **required** — a list of `.npz` motion clips, a directory of `.npz`, or a single path. You must also place the Unitree G1 description at `flash_rl/envs/isaaclab_envs/assets/unitree_description/urdf/g1/main.urdf`. See [`flash_rl/envs/isaaclab_envs/README.md`](flash_rl/envs/isaaclab_envs/README.md) for how to obtain the URDF and produce motion `.npz` clips (via `whole_body_tracking`'s `csv_to_npz`), plus the `.npz` key schema.
+> `env.motion.motion_files` is **required** — a list of `.npz` motion clips, a directory of `.npz`, or a single path. You must also place the Unitree G1 description at `flash_rl/envs/isaaclab_envs/assets/unitree_description/urdf/g1/main.urdf`. Motion `.npz` clips can be produced from retargeted CSV files with `scripts/motion/csv_to_npz.py`.
 
 ```bash
 uv run python train.py \
@@ -240,7 +240,7 @@ A reward-group sweep recipe (1024 envs, GPU buffer, AMP, `gamma=0.99`, `n_step=3
 
 The task is configurable at three levels, applied in order (later wins):
 
-1. **Edit the vendored modular cfg** — change defaults directly in `flash_rl/envs/isaaclab_envs/tracking/*_cfg.py` (e.g. add a reward/observation/termination term via the registries). This is the source-of-truth layer; the package README documents the 3-step add-a-term recipe.
+1. **Edit the vendored modular cfg** — change defaults directly in `flash_rl/envs/isaaclab_envs/tracking/*_cfg.py` (e.g. add a reward/observation/termination term via the registries).
 2. **Friendly CLI blocks** — `env.reward.*`, `env.observation.*`, `env.termination.*`, `env.robot.*`, `env.motion.*` in `configs/env/isaaclab_tracking.yaml` (or Hydra `--overrides`).
 3. **`cfg_overrides` dot-path escape hatch** — a flat `{"dotted.path": value}` map applied last, e.g. `env.cfg_overrides='{"sim.dt": 0.004, "scene.robot.actuators.legs.stiffness": 200.0}'`.
 
@@ -261,8 +261,6 @@ uv run python train.py \
 | Motion | `motion_global_anchor_pos`, `motion_global_anchor_ori`, `motion_body_pos`, `motion_body_ori`, `motion_body_lin_vel`, `motion_body_ang_vel` |
 | Regularization | `action_rate_l2`, `joint_limit` |
 | Safety | `undesired_contacts` |
-
-See [`flash_rl/envs/isaaclab_envs/README.md`](flash_rl/envs/isaaclab_envs/README.md) for the module layout, registries (`OBS_TERMS` / `REW_TERMS` / `TERM_TERMS`), the multi-dataset motion loader (multi-clip pooling + `balance_mode` + adaptive sampling), and the full override contract.
 
 ## Project Structure
 

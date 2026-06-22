@@ -26,11 +26,6 @@ from flash_rl.evaluation import evaluate, record_video
 from flash_rl.types import Tensor
 
 
-def _reset_training_rollout_state(train_env: object) -> tuple[Tensor, dict[str, Tensor]]:
-    observations, _ = train_env.reset()  # type: ignore[attr-defined]
-    return observations, {"next_observation": observations}
-
-
 def run(args: argparse.Namespace) -> None:
     ###############################
     # configs
@@ -135,9 +130,7 @@ def run(args: argparse.Namespace) -> None:
         actions = np.array(actions)
         next_observations, rewards, terminateds, truncateds, env_infos = train_env.step(actions)
         next_buffer_observations = next_observations.copy()
-        # Substitute the true terminal obs ONLY on truncation (timeout). For terminations the TD
-        # target zeros the bootstrap via (1 - done) with done=terminated, so next_obs is unused there;
-        # substituting only on truncation gives the critic the genuine terminal state to bootstrap on.
+        # Bootstrap on the true timeout observation; terminated transitions do not bootstrap.
         for env_idx in range(cfg.num_train_envs):
             if truncateds[env_idx]:
                 next_buffer_observations[env_idx] = env_infos["final_obs"][env_idx]
@@ -167,11 +160,11 @@ def run(args: argparse.Namespace) -> None:
                 update_counter -= 1
 
             # evaluation
-            shared_rollout_touched_train_env = False
+            reset_shared_rollout = False
             if cfg.evaluation_per_interaction_step and interaction_step % cfg.evaluation_per_interaction_step == 0:
                 eval_info = evaluate(agent, eval_env, cfg.num_eval_episodes, cfg.env.env_type)
                 logger.update_metric(**eval_info)
-                shared_rollout_touched_train_env = shared_rollout_touched_train_env or eval_env is train_env
+                reset_shared_rollout = reset_shared_rollout or eval_env is train_env
 
             # metrics
             if cfg.metrics_per_interaction_step and interaction_step % cfg.metrics_per_interaction_step == 0:
@@ -182,12 +175,11 @@ def run(args: argparse.Namespace) -> None:
             if cfg.recording_per_interaction_step and interaction_step % cfg.recording_per_interaction_step == 0:
                 video_info = record_video(agent, record_env, cfg.num_record_episodes, cfg.env.env_type)
                 logger.update_metric(**video_info)
-                shared_rollout_touched_train_env = (
-                    shared_rollout_touched_train_env or (cfg.num_record_episodes > 0 and record_env is train_env)
-                )
+                reset_shared_rollout = reset_shared_rollout or (cfg.num_record_episodes > 0 and record_env is train_env)
 
-            if shared_rollout_touched_train_env:
-                observations, transition = _reset_training_rollout_state(train_env)
+            if reset_shared_rollout:
+                observations, _ = train_env.reset()
+                transition = {"next_observation": observations}
 
             # logging
             if cfg.logging_per_interaction_step and interaction_step % cfg.logging_per_interaction_step == 0:

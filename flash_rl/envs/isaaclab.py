@@ -1,5 +1,5 @@
-from __future__ import annotations
-
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import Any, Union, cast
 
 import gymnasium as gym
@@ -9,6 +9,8 @@ from gymnasium.vector import VectorEnv
 from gymnasium.vector.utils import batch_space
 
 from ..types import F32NDArray, NDArray
+from .isaaclab_envs.tracking.overrides import apply_tracking_overrides, omegaconf_to_plain
+from .isaaclab_envs.utils.action_bounds import compute_joint_limit_action_bound
 
 # NOTE: There is no way to get the action bounds from the env, so we hardcode them here following FastTD3
 ACTION_BOUNDS = {
@@ -28,375 +30,6 @@ ACTION_BOUNDS = {
     "Isaac-Tracking-Flat-G1-v0": 1.0,
     "Isaac-Tracking-Flat-G1-WoSE-v0": 1.0,
 }
-
-
-# ----------------------------------------------------------------------------------------------------------------------
-# Config-override helpers (PURE: no isaaclab import). These operate on a duck-typed env_cfg so they stay unit-testable
-# without IsaacLab installed. See OVERRIDE CONTRACT in the task spec.
-# ----------------------------------------------------------------------------------------------------------------------
-def _set_by_path(obj: Any, dotted: str, value: Any) -> None:
-    """Set a (possibly nested) member on ``obj`` addressed by a dotted path.
-
-    Walks the path component by component, descending through dict members (``cur[part]``) or object attributes
-    (``getattr``), and assigns ``value`` to the final component (via ``cur[last]`` for dicts, ``setattr`` otherwise).
-
-    Args:
-        obj: The root object (an env_cfg-like structure of nested dataclasses / dicts).
-        dotted: A dotted path such as ``"scene.robot.actuators.legs.stiffness"``.
-        value: The value to assign at the final path component.
-    """
-    parts = dotted.split(".")
-    cur = obj
-    for part in parts[:-1]:
-        if isinstance(cur, dict):
-            cur = cur[part]
-        else:
-            cur = getattr(cur, part)
-    last = parts[-1]
-    if isinstance(cur, dict):
-        cur[last] = value
-    else:
-        setattr(cur, last, value)
-
-
-def apply_cfg_overrides(env_cfg: Any, cfg_overrides: dict[str, Any] | None = None) -> Any:
-    """Apply a flat mapping of dotted-path overrides onto ``env_cfg``.
-
-    Args:
-        env_cfg: The env_cfg-like object to mutate in place.
-        cfg_overrides: Mapping of dotted path -> value (e.g. ``{"sim.dt": 0.004}``). ``None`` is a no-op.
-
-    Returns:
-        The same ``env_cfg`` object (mutated in place), for chaining.
-    """
-    for path, val in (cfg_overrides or {}).items():
-        _set_by_path(env_cfg, path, val)
-    return env_cfg
-
-
-def _omegaconf_to_plain(x: Any) -> Any:
-    """Recursively convert OmegaConf ``DictConfig``/``ListConfig`` to plain ``dict``/``list``.
-
-    Plain Python objects pass through unchanged. The OmegaConf import is guarded so this helper works even when
-    OmegaConf is not installed.
-
-    Args:
-        x: An arbitrary object, possibly an OmegaConf container.
-
-    Returns:
-        A plain ``dict``/``list``/scalar mirror of ``x``.
-    """
-    try:
-        from omegaconf import DictConfig, ListConfig, OmegaConf
-
-        if isinstance(x, (DictConfig, ListConfig)):
-            x = OmegaConf.to_container(x, resolve=True)
-    except ImportError:
-        pass
-    if isinstance(x, dict):
-        return {k: _omegaconf_to_plain(v) for k, v in x.items()}
-    if isinstance(x, (list, tuple)):
-        return [_omegaconf_to_plain(v) for v in x]
-    return x
-
-
-def _has_observation_group(obs_space: gym.spaces.Space[Any], group_name: str) -> bool:
-    """Return whether an IsaacLab Dict observation space contains ``group_name``."""
-    return isinstance(obs_space, gym.spaces.Dict) and group_name in obs_space.spaces
-
-
-def _concat_flat_space_shape(*shapes: tuple[int, ...]) -> tuple[int, ...]:
-    """Return the flat shape produced by concatenating observation groups on the last dimension."""
-    return (sum(shape[-1] for shape in shapes),)
-
-
-def _scale_or_set(value: Any, scale: float | None, absolute: Any = None) -> Any:
-    """Scale a dict-or-scalar actuator field, or override it with an absolute value.
-
-    Args:
-        value: The current field value (a scalar, or a dict of name->scalar).
-        scale: A multiplicative factor applied to ``value`` when not ``None``.
-        absolute: If not ``None``, used directly (replacing ``value``) before any scaling.
-
-    Returns:
-        The new field value (same shape as ``value`` / ``absolute``).
-    """
-    if absolute is not None:
-        value = absolute
-    if scale is not None and scale != 1.0:
-        if isinstance(value, dict):
-            value = {k: v * scale for k, v in value.items()}
-        else:
-            value = value * scale
-    return value
-
-
-def _apply_robot_overrides(
-    env_cfg: Any,
-    robot: dict[str, Any] | None,
-) -> None:
-    """Apply robot / actuator cfg knobs onto ``env_cfg.scene.robot`` and ``env_cfg.actions``.
-
-    Covers global scales (stiffness/damping/effort/armature/velocity), per-actuator-group absolute
-    overrides, init pose, soft joint-limit factor, and action-scale scaling.
-
-    Args:
-        env_cfg: The env_cfg-like object to mutate in place.
-        robot: Robot/actuator override mapping (see OVERRIDE CONTRACT). ``None`` / empty is a no-op.
-    """
-    robot = dict(robot or {})
-    if not robot:
-        return
-
-    stiffness_scale = robot.get("stiffness_scale")
-    damping_scale = robot.get("damping_scale")
-    effort_limit_scale = robot.get("effort_limit_scale")
-    armature_scale = robot.get("armature_scale")
-    velocity_limit_scale = robot.get("velocity_limit_scale")
-    groups: dict[str, Any] = dict(robot.get("groups") or {})
-
-    actuators = env_cfg.scene.robot.actuators
-    actuator_items = actuators.items() if isinstance(actuators, dict) else vars(actuators).items()
-    for name, actuator in actuator_items:
-        if actuator is None:
-            continue
-        grp_cfg = groups.get(name) or {}
-        actuator.stiffness = _scale_or_set(actuator.stiffness, stiffness_scale, grp_cfg.get("stiffness"))
-        actuator.damping = _scale_or_set(actuator.damping, damping_scale, grp_cfg.get("damping"))
-        actuator.effort_limit_sim = _scale_or_set(
-            actuator.effort_limit_sim, effort_limit_scale, grp_cfg.get("effort_limit_sim")
-        )
-        actuator.armature = _scale_or_set(actuator.armature, armature_scale, grp_cfg.get("armature"))
-        actuator.velocity_limit_sim = _scale_or_set(
-            actuator.velocity_limit_sim, velocity_limit_scale, grp_cfg.get("velocity_limit_sim")
-        )
-
-    init_pos = robot.get("init_pos")
-    if init_pos is not None:
-        env_cfg.scene.robot.init_state.pos = tuple(init_pos)
-
-    soft_factor = robot.get("soft_joint_pos_limit_factor")
-    if soft_factor is not None:
-        env_cfg.scene.robot.soft_joint_pos_limit_factor = soft_factor
-
-    action_scale_scale = robot.get("action_scale_scale")
-    if action_scale_scale is not None and action_scale_scale != 1.0:
-        # joint_pos.scale is a per-joint dict (G1_ACTION_SCALE), so use the dict-aware helper
-        # (`dict * float` raises TypeError).
-        env_cfg.actions.joint_pos.scale = _scale_or_set(env_cfg.actions.joint_pos.scale, action_scale_scale)
-
-
-def _apply_reward_overrides(env_cfg: Any, reward: dict[str, Any] | None) -> None:
-    """Apply flat (single-critic) reward overrides onto the ``env_cfg.rewards`` RewTerm attrs.
-
-    The ``reward`` mapping is ``{term_name: {weight?, std?, enabled?}}``. ``enabled: false`` disables the term by
-    setting the attribute to ``None``; ``weight``/``std`` update the RewTerm in place. All terms are summed by
-    IsaacLab's ``RewardManager`` into a single scalar reward.
-
-    Args:
-        env_cfg: The env_cfg-like object to mutate in place.
-        reward: Flat reward override mapping. ``None`` is a no-op.
-    """
-    if not reward:
-        return
-    for term_name, term_cfg in reward.items():
-        term_cfg = term_cfg or {}
-        if term_cfg.get("enabled") is False:
-            setattr(env_cfg.rewards, term_name, None)
-            continue
-        term = getattr(env_cfg.rewards, term_name)
-        if term is None:
-            continue
-        if term_cfg.get("weight") is not None:
-            term.weight = term_cfg["weight"]
-        if term_cfg.get("std") is not None:
-            term.params["std"] = term_cfg["std"]
-
-
-def _apply_observation_overrides(env_cfg: Any, observation: dict[str, Any] | None) -> None:
-    """Apply observation enable/disable + noise-scaling onto ``env_cfg.observations``.
-
-    The ``observation`` mapping is ``{group(policy|critic): {term: {enabled?, noise_scale?}}}``. ``enabled: false``
-    disables the term (set to ``None``). ``noise_scale`` multiplies ``term.noise.n_min``/``n_max`` when the term has a
-    noise model.
-
-    Args:
-        env_cfg: The env_cfg-like object to mutate in place.
-        observation: Observation override mapping. ``None`` is a no-op.
-    """
-    if not observation:
-        return
-    for group_name, group_cfg in observation.items():
-        if not group_cfg:
-            continue
-        group = getattr(env_cfg.observations, group_name)
-        for term_name, term_cfg in group_cfg.items():
-            term_cfg = term_cfg or {}
-            if term_cfg.get("enabled") is False:
-                setattr(group, term_name, None)
-                continue
-            term = getattr(group, term_name)
-            if term is None:
-                continue
-            noise_scale = term_cfg.get("noise_scale")
-            if noise_scale is not None and noise_scale != 1.0 and getattr(term, "noise", None) is not None:
-                term.noise.n_min = term.noise.n_min * noise_scale
-                term.noise.n_max = term.noise.n_max * noise_scale
-
-
-def _apply_termination_overrides(env_cfg: Any, termination: dict[str, Any] | None) -> None:
-    """Apply termination thresholds / disable onto ``env_cfg.terminations``.
-
-    The ``termination`` mapping is ``{term: {enabled?, <param>: value}}``. ``enabled: false`` disables the term (set to
-    ``None``); any other key/value pair is written into ``term.params``.
-
-    Args:
-        env_cfg: The env_cfg-like object to mutate in place.
-        termination: Termination override mapping. ``None`` is a no-op.
-    """
-    if not termination:
-        return
-    for term_name, term_cfg in termination.items():
-        term_cfg = term_cfg or {}
-        if term_cfg.get("enabled") is False:
-            setattr(env_cfg.terminations, term_name, None)
-            continue
-        term = getattr(env_cfg.terminations, term_name)
-        if term is None:
-            continue
-        for key, value in term_cfg.items():
-            if key == "enabled":
-                continue
-            term.params[key] = value
-
-
-def _apply_motion_overrides(env_cfg: Any, motion: dict[str, Any] | None) -> None:
-    """Apply motion-loader / adaptive-sampling overrides onto ``env_cfg.commands.motion``.
-
-    The ``motion`` mapping accepts ``{motion_files?|motion_file?, balance_mode?, adaptive_sampling?: {...}}``. A single
-    ``motion_file`` string is normalized to a one-element ``motion_files`` list. The friendly ``adaptive_sampling``
-    block is mapped onto the real WBT cfg fields via the aliases ``kernel_size``->``adaptive_kernel_size``,
-    ``lambda``->``adaptive_lambda``, ``uniform_ratio``->``adaptive_uniform_ratio``, ``alpha``->``adaptive_alpha``.
-    Power users may instead set the exact ``adaptive_*`` field names directly. Any key that does not resolve to an
-    existing cfg attribute (after aliasing) is ignored.
-
-    Args:
-        env_cfg: The env_cfg-like object to mutate in place.
-        motion: Motion override mapping. ``None`` is a no-op.
-    """
-    if not motion:
-        return
-    cmd = env_cfg.commands.motion
-
-    motion_files = motion.get("motion_files")
-    motion_file = motion.get("motion_file")
-    if motion_files is not None:
-        if isinstance(motion_files, str):
-            motion_files = [motion_files]
-        cmd.motion_files = list(motion_files)
-    elif motion_file is not None:
-        cmd.motion_files = [motion_file]
-
-    if motion.get("balance_mode") is not None:
-        cmd.balance_mode = motion["balance_mode"]
-
-    adaptive = motion.get("adaptive_sampling")
-    if adaptive:
-        # Friendly schema keys -> real WBT cfg field names. Unknown keys are forwarded verbatim so power users can set
-        # the exact adaptive_* fields directly.
-        alias = {
-            "kernel_size": "adaptive_kernel_size",
-            "lambda": "adaptive_lambda",
-            "uniform_ratio": "adaptive_uniform_ratio",
-            "alpha": "adaptive_alpha",
-        }
-        for key, value in adaptive.items():
-            if value is None:
-                continue
-            attr = alias.get(key, key)
-            if hasattr(cmd, attr):
-                setattr(cmd, attr, value)
-
-
-def apply_tracking_overrides(
-    env_cfg: Any,
-    reward: dict[str, Any] | None = None,
-    observation: dict[str, Any] | None = None,
-    termination: dict[str, Any] | None = None,
-    robot: dict[str, Any] | None = None,
-    motion: dict[str, Any] | None = None,
-    cfg_overrides: dict[str, Any] | None = None,
-) -> Any:
-    """Apply the full friendly + dot-path override stack onto a tracking ``env_cfg``.
-
-    Order matters: the friendly grouped blocks are applied first, then the general ``cfg_overrides`` dot-path map LAST
-    so that explicit dot-paths always win. All inputs are plain Python (convert OmegaConf with ``_omegaconf_to_plain``
-    before calling). This function is PURE (no isaaclab import) and mutates ``env_cfg`` in place.
-
-    Args:
-        env_cfg: The tracking env_cfg-like object to mutate in place.
-        reward: Flat reward overrides ``{term: {weight?, std?, enabled?}}`` (single-critic, summed).
-        observation: Observation overrides ``{policy|critic: {term: {enabled?, noise_scale?}}}``.
-        termination: Termination overrides ``{term: {enabled?, <param>: value}}``.
-        robot: Robot / actuator cfg overrides (scales + absolutes + per-group knobs).
-        motion: Motion-loader overrides ``{motion_files?|motion_file?, balance_mode?, adaptive_sampling?}``.
-        cfg_overrides: General dot-path escape hatch applied LAST.
-
-    Returns:
-        The same ``env_cfg`` object (mutated in place), for chaining.
-    """
-    _apply_reward_overrides(env_cfg, reward)
-    _apply_observation_overrides(env_cfg, observation)
-    _apply_termination_overrides(env_cfg, termination)
-    _apply_robot_overrides(env_cfg, robot)
-    _apply_motion_overrides(env_cfg, motion)
-    # FINALLY: dot-path overrides win.
-    apply_cfg_overrides(env_cfg, cfg_overrides)
-    return env_cfg
-
-
-def compute_joint_limit_action_bound(
-    soft_limits: torch.Tensor,
-    default_pos: torch.Tensor,
-    action_scale: torch.Tensor,
-    fraction: float = 1.0,
-    mode: str = "asymmetric",
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Per-joint affine (bias, range) mapping a tanh action in [-1, 1] to a joint-position window.
-
-    A ``JointPositionAction`` computes ``target = default + scale * action``. We pick the per-joint
-    action window so that ``action in [-1, 1]`` keeps ``target`` within ``fraction * [lower, upper]``
-    (the soft joint position limits). The env applies ``final = bias + range * clamp(action, -1, 1)``
-    in ``step()``; the actor still emits plain ``[-1, 1]`` (buffer/agent untouched).
-
-    Args:
-        soft_limits: ``[J, 2]`` (lower, upper) soft joint position limits (already soft-scaled).
-        default_pos: ``[J]`` default joint positions (the action offset).
-        action_scale: ``[J]`` per-joint JointPositionAction scale.
-        fraction: f in (0, 1]; scales how far toward each limit the extremes reach.
-        mode: ``"asymmetric"`` (extremes hit lower/upper exactly) or ``"symmetric"`` (``bias=0``).
-
-    Returns:
-        ``(bias, range)``, each ``[J]``: the affine params for ``final = bias + range * action``.
-    """
-    lower = soft_limits[..., 0]
-    upper = soft_limits[..., 1]
-    eps = 1e-8
-    zero = action_scale.abs() < eps
-    safe_scale = torch.where(zero, torch.ones_like(action_scale), action_scale)
-    # action values whose target hits the lower / upper limit (signed; works for negative scale too).
-    a_lo = fraction * (lower - default_pos) / safe_scale
-    a_hi = fraction * (upper - default_pos) / safe_scale
-    if mode == "symmetric":
-        rng = torch.maximum(a_hi.abs(), a_lo.abs())
-        bias = torch.zeros_like(rng)
-    else:  # asymmetric (default): ±1 maps exactly onto the (soft) limits
-        bias = 0.5 * (a_hi + a_lo)
-        rng = 0.5 * (a_hi - a_lo)
-    # joints with ~zero scale have no actuation effect -> no action range.
-    bias = torch.where(zero, torch.zeros_like(bias), bias)
-    rng = torch.where(zero, torch.zeros_like(rng), rng)
-    return bias, rng
 
 
 def recursive_to_numpy(
@@ -474,12 +107,12 @@ class IsaacLabVectorEnv(
             # Convert any OmegaConf containers to plain Python, then apply the full override stack before gym.make.
             apply_tracking_overrides(
                 env_cfg,
-                reward=_omegaconf_to_plain(reward),
-                observation=_omegaconf_to_plain(observation),
-                termination=_omegaconf_to_plain(termination),
-                robot=_omegaconf_to_plain(robot),
-                motion=_omegaconf_to_plain(motion),
-                cfg_overrides=_omegaconf_to_plain(cfg_overrides),
+                reward=omegaconf_to_plain(reward),
+                observation=omegaconf_to_plain(observation),
+                termination=omegaconf_to_plain(termination),
+                robot=omegaconf_to_plain(robot),
+                motion=omegaconf_to_plain(motion),
+                cfg_overrides=omegaconf_to_plain(cfg_overrides),
             )
 
         self.envs = gym.make(env_name, cfg=env_cfg, render_mode=None)
@@ -504,14 +137,14 @@ class IsaacLabVectorEnv(
         # NOTE: Action range: [-1, 1] * action_bounds (https://github.com/google-deepmind/mujoco_playground/issues/19)
         obs_space = cast(Any, self.envs.unwrapped).single_observation_space
         self.obs_size = obs_space["policy"].shape
-        self.asymmetric_obs = _has_observation_group(obs_space, "critic")
+        self.asymmetric_obs = isinstance(obs_space, gym.spaces.Dict) and "critic" in obs_space.spaces
         if self.asymmetric_obs:
             # NOTE: Env will treat concatenate actor & critic states as the observation,
             # but will give 'actual' observation size in the info.
             self.critic_obs_size = obs_space["critic"].shape
             # NOTE: setting to [0, 0] since we only need the shape and dtype
             self.single_observation_space = gym.spaces.Box(
-                low=0.0, high=0.0, shape=_concat_flat_space_shape(self.obs_size, self.critic_obs_size), dtype=np.float32
+                low=0.0, high=0.0, shape=(self.obs_size[-1] + self.critic_obs_size[-1],), dtype=np.float32
             )
             self.observation_space = batch_space(self.single_observation_space, self.num_envs)
         else:
@@ -526,7 +159,7 @@ class IsaacLabVectorEnv(
         # in step() via final = bias + range * clamp(action, -1, 1).
         self._action_bias: torch.Tensor | None = None
         self._action_range: torch.Tensor | None = None
-        action_bound = _omegaconf_to_plain(action_bound)
+        action_bound = omegaconf_to_plain(action_bound)
         if isinstance(action_bound, dict) and action_bound.get("type") == "joint_limit":
             self.action_bounds = None
             self._action_bias, self._action_range = self._build_joint_limit_bound(
@@ -540,6 +173,17 @@ class IsaacLabVectorEnv(
                 low=-1.0 * self.action_bounds, high=1.0 * self.action_bounds, shape=self.action_size, dtype=np.float32
             )
         self.action_space = batch_space(self.single_action_space, self.num_envs)
+
+    @contextmanager
+    def evaluation_mode(self) -> Iterator[None]:
+        """Temporarily tell IsaacLab command terms to use deterministic evaluation behavior."""
+        base_env = cast(Any, self.envs.unwrapped)
+        previous = getattr(base_env, "is_evaluating", False)
+        setattr(base_env, "is_evaluating", True)
+        try:
+            yield
+        finally:
+            setattr(base_env, "is_evaluating", previous)
 
     def _install_terminal_obs_capture(self, base_env: Any) -> None:
         """Hook ``base_env._reset_idx`` to snapshot the true terminal observation before auto-reset.
@@ -618,7 +262,9 @@ class IsaacLabVectorEnv(
         infos.update({"actor_observation_size": self.obs_size, "asymmetric_obs": self.asymmetric_obs})
         return obs, infos
 
-    def step(self, actions: Union[torch.Tensor, F32NDArray]) -> tuple[
+    def step(
+        self, actions: Union[torch.Tensor, F32NDArray]
+    ) -> tuple[
         Union[torch.Tensor, F32NDArray],
         Union[torch.Tensor, F32NDArray],
         Union[torch.Tensor, F32NDArray],
