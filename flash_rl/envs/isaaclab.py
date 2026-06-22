@@ -125,7 +125,7 @@ class IsaacLabVectorEnv(
         self._final_obs_buf: dict[str, torch.Tensor] | None = None
         _base_env = cast(Any, self.envs.unwrapped)
         if hasattr(_base_env, "_reset_idx") and hasattr(_base_env, "observation_manager"):
-            self._install_terminal_obs_capture(_base_env)
+            self._patch_reset_idx_for_final_obs(_base_env)
 
         self.num_envs = cast(Any, self.envs.unwrapped).num_envs
         self.max_episode_steps = cast(Any, self.envs.unwrapped).max_episode_length
@@ -172,7 +172,7 @@ class IsaacLabVectorEnv(
     def set_eval_mode(self, eval_mode: bool) -> None:
         setattr(cast(Any, self.envs.unwrapped), "eval_mode", eval_mode)
 
-    def _install_terminal_obs_capture(self, base_env: Any) -> None:
+    def _patch_reset_idx_for_final_obs(self, base_env: Any) -> None:
         """Hook ``base_env._reset_idx`` to snapshot the true terminal observation before auto-reset.
 
         IsaacLab resets done envs inside ``step()`` and recomputes observations afterwards, so the
