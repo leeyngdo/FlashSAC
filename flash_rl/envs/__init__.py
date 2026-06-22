@@ -97,7 +97,8 @@ def create_envs(
             cfg_overrides=kwargs.get("cfg_overrides"),
             action_bound=kwargs.get("action_bound"),
         )
-        # IsaacSim allows one SimulationApp per process.
+        # NOTE: IsaacLab/IsaacSim only supports one SimulationApp instance per process by design.
+        # See https://github.com/isaac-sim/IsaacLab/discussions/1241
         eval_env = train_env
         record_env = train_env
 

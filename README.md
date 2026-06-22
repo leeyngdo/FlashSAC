@@ -219,49 +219,6 @@ Key arguments:
 > [!NOTE]
 > `agent.buffer_max_length` can be set to a small value (e.g., 1) since the replay buffer is not used during play.
 
-## Motion Tracking (IsaacLab)
-
-FlashSAC vendors the [BeyondMimic](https://beyondmimic.github.io/) G1 whole-body motion-tracking task in a **KraftonLab-style modular layout** under `flash_rl/envs/isaaclab_envs/`. It registers the gym ids `Isaac-Tracking-Flat-G1-v0` (with state estimation) and `Isaac-Tracking-Flat-G1-WoSE-v0` (without state estimation), trained with the **holosoma FastSAC reward preset** as the default.
-
-> [!IMPORTANT]
-> `env.motion.motion_files` is **required** — a list of `.npz` motion clips, a directory of `.npz`, or a single path. You must also place the Unitree G1 description at `flash_rl/envs/isaaclab_envs/assets/unitree_description/urdf/g1/main.urdf`. Motion `.npz` clips can be produced from retargeted CSV files with `scripts/motion/csv_to_npz.py`.
-
-```bash
-uv run python train.py \
-    --overrides env=isaaclab_tracking \
-    --overrides env.motion.motion_files='[motions/dance1.npz, motions/walk1.npz]' \
-    --overrides agent=flashSAC \
-    --overrides agent.asymmetric_observation=true
-```
-
-A reward-group sweep recipe (1024 envs, GPU buffer, AMP, `gamma=0.99`, `n_step=3`) is in `scripts/run_isaaclab_tracking.sh`.
-
-### Three control layers
-
-The task is configurable at three levels, applied in order (later wins):
-
-1. **Edit the vendored modular cfg** — change defaults directly in `flash_rl/envs/isaaclab_envs/tracking/*_cfg.py` (e.g. add a reward/observation/termination term via the registries).
-2. **Friendly CLI blocks** — `env.reward.*`, `env.observation.*`, `env.termination.*`, `env.robot.*`, `env.motion.*` in `configs/env/isaaclab_tracking.yaml` (or Hydra `--overrides`).
-3. **`cfg_overrides` dot-path escape hatch** — a flat `{"dotted.path": value}` map applied last, e.g. `env.cfg_overrides='{"sim.dt": 0.004, "scene.robot.actuators.legs.stiffness": 200.0}'`.
-
-### Reward Overrides
-
-Rewards are a flat single-critic set summed into one scalar reward (SAC-compatible). Friendly overrides are per-term `weight`/`std`/`enabled`:
-
-```bash
-uv run python train.py \
-    --overrides env=isaaclab_tracking \
-    --overrides env.motion.motion_files='[motions/dance1.npz]' \
-    --overrides env.reward.motion_body_pos.weight=2.0 \
-    --overrides env.reward.action_rate_l2.weight=-1.0
-```
-
-| Category | Terms |
-|---|---|
-| Motion | `motion_global_anchor_pos`, `motion_global_anchor_ori`, `motion_body_pos`, `motion_body_ori`, `motion_body_lin_vel`, `motion_body_ang_vel` |
-| Regularization | `action_rate_l2`, `joint_limit` |
-| Safety | `undesired_contacts` |
-
 ## Project Structure
 
 ```

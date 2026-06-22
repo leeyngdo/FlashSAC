@@ -1,5 +1,6 @@
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from importlib import import_module
 from typing import Any, Union, cast
 
 import gymnasium as gym
@@ -12,7 +13,8 @@ from ..types import F32NDArray, NDArray
 from .isaaclab_envs.tracking.overrides import apply_tracking_overrides, omegaconf_to_plain
 from .isaaclab_envs.utils.action_bounds import compute_joint_limit_action_bound
 
-# IsaacLab does not expose these bounds directly.
+# NOTE: There is no way to infer each IsaacLab task's action scale from the Gym action space,
+# so we hardcode the bounds here following FastTD3.
 ACTION_BOUNDS = {
     "Isaac-Repose-Cube-Shadow-Direct-v0": 1.0,
     "Isaac-Repose-Cube-Allegro-Direct-v0": 1.0,
@@ -28,6 +30,11 @@ ACTION_BOUNDS = {
     "Isaac-Velocity-Rough-Anymal-D-v0": 1.0,
     "Isaac-Tracking-Flat-G1-v0": 1.0,
     "Isaac-Tracking-Flat-G1-WoSE-v0": 1.0,
+}
+
+# NOTE: Local IsaacLab tasks must be imported after AppLauncher starts IsaacSim and before parse_env_cfg.
+LOCAL_ISAACLAB_TASKS: dict[str, tuple[str, Callable[..., Any] | None]] = {
+    "Isaac-Tracking": ("flash_rl.envs.isaaclab_envs.tracking.config.g1", apply_tracking_overrides),
 }
 
 
@@ -84,10 +91,10 @@ class IsaacLabVectorEnv(
         app_launcher = AppLauncher(headless=headless, device=device, enable_cameras=enable_cameras or not headless)
         self.simulation_app = app_launcher.app
 
-        is_tracking = env_name.startswith("Isaac-Tracking")
-        if is_tracking:
-            # Register local tracking tasks after AppLauncher initializes IsaacLab.
-            import flash_rl.envs.isaaclab_envs.tracking.config.g1  # noqa: F401
+        local_task = next((task for prefix, task in LOCAL_ISAACLAB_TASKS.items() if env_name.startswith(prefix)), None)
+        if local_task is not None:
+            module_name, _ = local_task
+            import_module(module_name)
 
         from isaaclab_tasks.utils.parse_cfg import parse_env_cfg
 
@@ -100,16 +107,18 @@ class IsaacLabVectorEnv(
         self.seed = seed
         self.device = device
 
-        if is_tracking:
-            apply_tracking_overrides(
-                env_cfg,
-                reward=omegaconf_to_plain(reward),
-                observation=omegaconf_to_plain(observation),
-                termination=omegaconf_to_plain(termination),
-                robot=omegaconf_to_plain(robot),
-                motion=omegaconf_to_plain(motion),
-                cfg_overrides=omegaconf_to_plain(cfg_overrides),
-            )
+        if local_task is not None:
+            _, apply_local_overrides = local_task
+            if apply_local_overrides is not None:
+                apply_local_overrides(
+                    env_cfg,
+                    reward=omegaconf_to_plain(reward),
+                    observation=omegaconf_to_plain(observation),
+                    termination=omegaconf_to_plain(termination),
+                    robot=omegaconf_to_plain(robot),
+                    motion=omegaconf_to_plain(motion),
+                    cfg_overrides=omegaconf_to_plain(cfg_overrides),
+                )
 
         self.envs = gym.make(env_name, cfg=env_cfg, render_mode=None)
         setattr(cast(Any, self.envs.unwrapped), "is_evaluating", False)
@@ -124,11 +133,16 @@ class IsaacLabVectorEnv(
         self.max_episode_steps = cast(Any, self.envs.unwrapped).max_episode_length
         self.to_numpy = to_numpy
 
+        # Get observation/action spaces
+        # NOTE: Action range: [-1, 1] * action_bounds (https://github.com/google-deepmind/mujoco_playground/issues/19)
         obs_space = cast(Any, self.envs.unwrapped).single_observation_space
         self.obs_size = obs_space["policy"].shape
         self.asymmetric_obs = isinstance(obs_space, gym.spaces.Dict) and "critic" in obs_space.spaces
         if self.asymmetric_obs:
+            # NOTE: Env will treat concatenate actor & critic states as the observation,
+            # but will give 'actual' observation size in the info.
             self.critic_obs_size = obs_space["critic"].shape
+            # NOTE: setting to [0, 0] since we only need the shape and dtype
             self.single_observation_space = gym.spaces.Box(
                 low=0.0, high=0.0, shape=(self.obs_size[-1] + self.critic_obs_size[-1],), dtype=np.float32
             )
@@ -143,6 +157,7 @@ class IsaacLabVectorEnv(
         self._action_range: torch.Tensor | None = None
         action_bound = omegaconf_to_plain(action_bound)
         if isinstance(action_bound, dict) and action_bound.get("type") == "joint_limit":
+            # NOTE: The actor still outputs normalized actions; step() maps them to the joint-limit window.
             self.action_bounds = None
             self._action_bias, self._action_range = self._build_joint_limit_bound(
                 fraction=float(action_bound.get("fraction", 1.0)),
@@ -228,7 +243,13 @@ class IsaacLabVectorEnv(
             obs = torch.cat((obs, critic_obs), dim=-1)
         else:
             critic_obs = None
+        # NOTE: decorrelate episode horizons like RSL‑RL
+        # In IsaacLab, `dones` is computed as follows:
+        # `time_out = self.episode_length_buf >= self.max_episode_length - 1`
+        # While training, this code spreads out the resets to avoid spikes
+        # when many environments reset at a similar time.
         if random_start_init:
+            # step in current episode (per env)
             cast(Any, self.envs.unwrapped).episode_length_buf = torch.randint_like(
                 cast(Any, self.envs.unwrapped).episode_length_buf, high=int(self.max_episode_steps)
             )
@@ -264,6 +285,8 @@ class IsaacLabVectorEnv(
         else:
             critic_obs = None
         infos = {"time_outs": truncations, "observations": {"critic": critic_obs}}
+        # NOTE: IsaacLab autoresets done envs inside step(), so returned observations can be post-reset.
+        # See https://github.com/isaac-sim/IsaacLab/issues/1362
         if self._final_obs_buf is not None:
             final_obs = self._final_obs_buf["policy"]
             if self.asymmetric_obs:
@@ -273,18 +296,10 @@ class IsaacLabVectorEnv(
             infos["final_obs"] = obs
 
         log = raw_infos.get("log") if isinstance(raw_infos, dict) else None
-        if log and bool(terminations.any()) | bool(truncations.any()):
+        if log and (bool(terminations.any()) or bool(truncations.any())):
             episode_info: dict[str, float] = {}
             for key, value in log.items():
-                scalar = float(value.item()) if hasattr(value, "item") else float(value)
-                if key.startswith("Episode_Reward/"):
-                    episode_info["rewards/" + key.split("/", 1)[1]] = scalar
-                elif key.startswith("Episode_Termination/"):
-                    episode_info["terminations/" + key.split("/", 1)[1]] = scalar
-                elif key.startswith("Metrics/"):
-                    episode_info["metrics/" + key.split("/", 1)[1]] = scalar
-                else:
-                    episode_info[key] = scalar
+                episode_info[key] = float(value.item()) if hasattr(value, "item") else float(value)
             if episode_info:
                 infos["episode_info"] = episode_info
 
@@ -297,6 +312,8 @@ class IsaacLabVectorEnv(
         return obs, rew, terminations, truncations, infos
 
     def close(self, **kwargs: Any) -> None:
+        # self.envs.close(**kwargs)
+        # self.simulation_app.close()
         return
 
     def render(self) -> None:

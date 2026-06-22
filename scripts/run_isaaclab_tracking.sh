@@ -1,7 +1,9 @@
 #!/bin/bash
-# IsaacLab G1 motion-tracking recipe.
+##################################################################################
+# IsaacLab Motion Tracking (GPU Simulator)
+##################################################################################
 
-# .npz path, list, or directory.
+# Hydra list literal syntax: ["/path/a.npz","/path/b.npz"] or a directory "/path/motions".
 MOTION_FILES='[/home/ubuntu/youngdo/FlashSAC/flash_rl/envs/isaaclab_envs/motions/TODO_REPLACE_ME.npz]'
 
 seeds=( 0 1000 2000 3000 4000 )
