@@ -210,7 +210,7 @@ class MotionCommand(CommandTerm):
         self._set_uniform_sampling_metrics()
 
     def _adaptive_sampling(self, env_ids: Sequence[int]):
-        if getattr(self._env, "is_evaluating", False):
+        if getattr(self._env, "eval_mode", False):
             self._uniform_frame_sampling(env_ids)
             return
 

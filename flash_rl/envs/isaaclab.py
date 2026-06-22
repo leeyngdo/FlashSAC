@@ -1,5 +1,4 @@
-from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from collections.abc import Callable
 from importlib import import_module
 from typing import Any, Union, cast
 
@@ -121,7 +120,7 @@ class IsaacLabVectorEnv(
                 )
 
         self.envs = gym.make(env_name, cfg=env_cfg, render_mode=None)
-        setattr(cast(Any, self.envs.unwrapped), "is_evaluating", False)
+        setattr(cast(Any, self.envs.unwrapped), "eval_mode", False)
 
         # Capture terminal observations before IsaacLab's same-step autoreset.
         self._final_obs_buf: dict[str, torch.Tensor] | None = None
@@ -171,16 +170,8 @@ class IsaacLabVectorEnv(
             )
         self.action_space = batch_space(self.single_action_space, self.num_envs)
 
-    @contextmanager
-    def evaluation_mode(self) -> Iterator[None]:
-        """Temporarily tell IsaacLab command terms to use deterministic evaluation behavior."""
-        base_env = cast(Any, self.envs.unwrapped)
-        previous = getattr(base_env, "is_evaluating", False)
-        setattr(base_env, "is_evaluating", True)
-        try:
-            yield
-        finally:
-            setattr(base_env, "is_evaluating", previous)
+    def set_eval_mode(self, eval_mode: bool) -> None:
+        setattr(cast(Any, self.envs.unwrapped), "eval_mode", eval_mode)
 
     def _install_terminal_obs_capture(self, base_env: Any) -> None:
         """Hook ``base_env._reset_idx`` to snapshot the true terminal observation before auto-reset.
