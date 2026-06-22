@@ -63,9 +63,16 @@ def evaluate(
                     if "success" in final_info:
                         final_success = final_info["success"][idx].astype("float") * (1 - dones[idx])
                         success_end[idx] = final_success
+            else:
+                pass
 
+            # once an episode is done in a sub-environment, we assume it to be done.
+            # also, we assume to be done whether it is terminated or truncated during evaluation.
             dones = np.maximum(dones, terminateds)
             dones = np.maximum(dones, truncateds)
+
+            # proceed
+            observations = next_observations
 
         for env_idx in range(num_envs):
             total_return_list.append(returns[env_idx])
@@ -102,6 +109,7 @@ def record_video(
         eval_mode(True)
 
     num_envs = env.num_envs
+    # assert num_episodes % num_envs == 0, "num_episodes must be divisible by env.num_envs"
     num_eval_episodes_per_env = max(num_episodes // num_envs, 1)
 
     total_videos = []
@@ -110,9 +118,9 @@ def record_video(
         videos: list[NDArray] = []
 
         if env_type == "isaaclab":
-            observations, _ = env.reset(random_start_init=False)  # type: ignore[call-arg]
+            observations, infos = env.reset(random_start_init=False)  # type: ignore[call-arg]
         else:
-            observations, _ = env.reset()
+            observations, infos = env.reset()
         prev_transition: MutableMapping[str, Tensor] = {"next_observation": observations}
         images = env.render()  # type: ignore
         dones = np.zeros(num_envs)
@@ -123,18 +131,23 @@ def record_video(
                 training=False,
             )
             actions = np.array(actions)
-            next_observations, _, terminateds, truncateds, _ = env.step(actions)
+            next_observations, rewards, terminateds, truncateds, infos = env.step(actions)
 
             prev_transition = {"next_observation": next_observations}
 
+            # once an episode is done in a sub-environment, we assume it to be done.
             dones = np.maximum(dones, terminateds)
             dones = np.maximum(dones, truncateds)
 
+            # proceed
             videos.append(images)  # type: ignore
             images = env.render()
+            observations = next_observations
 
         total_videos.append(np.stack(videos, axis=1))  # (num_envs, t, c, h, w)
 
+    # TODO: if there is termination, video length can be different
+    # maybe add zero-padding depending on the max length
     total_videos = np.concatenate(total_videos, axis=0)  # (b, t, h, w, c)
     total_videos = total_videos[:, :video_length]
     total_videos = total_videos.transpose(0, 1, 4, 2, 3)  # (b, t, c, h, w)

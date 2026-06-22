@@ -12,8 +12,7 @@ from ..types import F32NDArray, NDArray
 from .isaaclab_envs.tracking.overrides import apply_tracking_overrides, omegaconf_to_plain
 from .isaaclab_envs.utils.action_bounds import compute_joint_limit_action_bound
 
-# NOTE: There is no way to infer each IsaacLab task's action scale from the Gym action space,
-# so we hardcode the bounds here following FastTD3.
+# NOTE: There is no way to get the action bounds from the env, so we hardcode them here following FastTD3
 ACTION_BOUNDS = {
     "Isaac-Repose-Cube-Shadow-Direct-v0": 1.0,
     "Isaac-Repose-Cube-Allegro-Direct-v0": 1.0,
@@ -276,7 +275,8 @@ class IsaacLabVectorEnv(
         else:
             critic_obs = None
         infos = {"time_outs": truncations, "observations": {"critic": critic_obs}}
-        # NOTE: IsaacLab autoresets done envs inside step(), so returned observations can be post-reset.
+        # NOTE: There's really no way to get the raw observations from IsaacLab
+        # We just use the 'reset_obs' as next_obs, unfortunately.
         # See https://github.com/isaac-sim/IsaacLab/issues/1362
         if self._final_obs_buf is not None:
             final_obs = self._final_obs_buf["policy"]
