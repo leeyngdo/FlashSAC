@@ -85,10 +85,18 @@ def create_envs(
         assert rescale_action is None, "Unused hyperparameter in IsaacLab."
         assert num_eval_envs is None, "Unused hyperparameter in IsaacLab."
         assert num_record_envs is None, "Unused hyperparameter in IsaacLab."
+        # Optional tracking-task cfg knobs (velocity configs lack these keys -> None -> no-op).
         train_env = make_isaaclab_env(
             env_name=env_name,
             num_envs=num_train_envs,
             seed=seed,
+            reward=kwargs.get("reward"),
+            observation=kwargs.get("observation"),
+            termination=kwargs.get("termination"),
+            robot=kwargs.get("robot"),
+            motion=kwargs.get("motion"),
+            cfg_overrides=kwargs.get("cfg_overrides"),
+            action_bound=kwargs.get("action_bound"),
         )
         # NOTE: IsaacLab/IsaacSim only supports one SimulationApp instance per process by design.
         # See https://github.com/isaac-sim/IsaacLab/discussions/1241

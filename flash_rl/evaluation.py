@@ -7,7 +7,38 @@ from .agents.base_agent import BaseAgent
 from .types import NDArray, Tensor
 
 
+def _set_env_evaluating(env: VectorEnv[NDArray, NDArray, NDArray], env_type: str, enabled: bool) -> tuple[Any, Any] | None:
+    if env_type != "isaaclab":
+        return None
+    base_env = getattr(getattr(env, "envs", None), "unwrapped", None)
+    if base_env is None:
+        return None
+    previous = getattr(base_env, "is_evaluating", False)
+    setattr(base_env, "is_evaluating", enabled)
+    return base_env, previous
+
+
+def _restore_env_evaluating(token: tuple[Any, Any] | None) -> None:
+    if token is None:
+        return
+    base_env, previous = token
+    setattr(base_env, "is_evaluating", previous)
+
+
 def evaluate(
+    agent: BaseAgent[Any],
+    env: VectorEnv[NDArray, NDArray, NDArray],
+    num_episodes: int,
+    env_type: str,
+) -> dict[str, float]:
+    token = _set_env_evaluating(env, env_type, True)
+    try:
+        return _evaluate_impl(agent, env, num_episodes, env_type)
+    finally:
+        _restore_env_evaluating(token)
+
+
+def _evaluate_impl(
     agent: BaseAgent[Any],
     env: VectorEnv[NDArray, NDArray, NDArray],
     num_episodes: int,
@@ -97,6 +128,20 @@ def record_video(
 ) -> dict[str, Any]:
     if num_episodes == 0:
         return {}
+    token = _set_env_evaluating(env, env_type, True)
+    try:
+        return _record_video_impl(agent, env, num_episodes, env_type, video_length)
+    finally:
+        _restore_env_evaluating(token)
+
+
+def _record_video_impl(
+    agent: BaseAgent[Any],
+    env: VectorEnv[NDArray, NDArray, NDArray],
+    num_episodes: int,
+    env_type: str,
+    video_length: int = 1000,
+) -> dict[str, Any]:
     num_envs = env.num_envs
     # assert num_episodes % num_envs == 0, "num_episodes must be divisible by env.num_envs"
     num_eval_episodes_per_env = max(num_episodes // num_envs, 1)

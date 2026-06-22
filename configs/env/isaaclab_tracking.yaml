@@ -1,0 +1,77 @@
+##################################################################################
+# Isaac Lab Motion Tracking (G1)
+##################################################################################
+
+env_type: 'isaaclab'
+env_name: 'Isaac-Tracking-Flat-G1-v0'
+num_env_steps: ${num_env_steps}
+
+seed: ${seed}
+num_train_envs: ${num_train_envs}
+num_eval_envs: ${num_eval_envs}
+num_record_envs: ${num_record_envs}
+rescale_action: null
+max_episode_steps: null
+
+# Motion dataset (REQUIRED): list of .npz paths OR a directory of .npz (or a single path).
+motion:
+  motion_files: ???
+  balance_mode: frame      # frame | motion
+  # Adaptive sampling (active in balance_mode=frame). Friendly aliases map onto the
+  # MotionCommandCfg.adaptive_* fields: kernel_size->adaptive_kernel_size, etc.
+  adaptive_sampling: {kernel_size: 1, lambda: 0.8, uniform_ratio: 0.1, alpha: 0.001}
+
+# Reward terms (single-critic: all summed into one scalar). FastSAC defaults.
+# Each term is logged separately as rewards/<term>. Override: env.reward.<term>.weight / .std,
+# or disable a term with env.reward.<term>.enabled=false.
+reward:
+  motion_global_anchor_pos: {weight: 1.0, std: 0.3}
+  motion_global_anchor_ori: {weight: 0.5, std: 0.4}
+  motion_body_pos:          {weight: 2.0, std: 0.3}
+  motion_body_ori:          {weight: 1.0, std: 0.4}
+  motion_body_lin_vel:      {weight: 1.0, std: 1.0}
+  motion_body_ang_vel:      {weight: 1.0, std: 3.14}
+  action_rate_l2:           {weight: -1.0}
+  joint_limit:              {weight: -10.0}
+  undesired_contacts:       {weight: -0.1}
+
+# Observation: enable/disable or scale noise; group is policy|critic; omit to keep default.
+observation:
+  policy:
+    base_lin_vel: {enabled: true, noise_scale: 1.0}
+
+# Termination: thresholds / disable; omit to keep default.
+termination:
+  anchor_pos:  {enabled: true, threshold: 0.5}
+  anchor_ori:  {enabled: true, threshold: 0.8}
+  ee_body_pos: {enabled: true, threshold: 0.25}
+
+# Robot / actuator cfg knobs; null/1.0 = keep default (the g1.py factory).
+robot:
+  init_pos: null
+  soft_joint_pos_limit_factor: null
+  stiffness_scale: null
+  damping_scale: null
+  effort_limit_scale: null
+  armature_scale: null
+  velocity_limit_scale: null
+  action_scale_scale: null
+  groups: null
+
+# Action bound. type=scalar -> env clamps action to [-1,1]*ACTION_BOUNDS (back-compat). type=joint_limit
+# bounds each joint's action by its (soft) position limits: action in [-1,1] maps onto a per-joint window.
+# mode=symmetric (DEFAULT, holosoma-faithful): bias=0 so a=0 -> default(reference) pose, rng=max_range/scale
+# -> ==holosoma's `action_scaling_factors=max_range/action_scale`, byte-identical at fraction=1.0.
+# mode=asymmetric (rsl_rl-style): +-1 hit lower/upper exactly, but bias!=0 so a=0 -> soft-limit MIDPOINT,
+# NOT the reference pose -> a fresh policy starts displaced and trips position terminations (S1 showstopper).
+action_bound:
+  type: scalar             # scalar (DEFAULT: action in [-1,1] -> target = default +- scale, WBT-narrow) | joint_limit
+  # NOTE: joint_limit (wide per-joint range) empirically COLLAPSES training here: FlashSAC's UnitLinear
+  # mean head is renorm'd to unit-norm every step, pinning pre-tanh logits at ~N(0,1) -> tanh~0.55 of the
+  # range. Fine at scalar (~0.14 rad) but ~0.8 rad at wide range -> slams joints to limits -> 3-step death.
+  # Use joint_limit only with the rsl_rl-style fixes (near-zero-emittable mean head + log_action_range).
+  fraction: 1.0            # f in (0,1]; 1.0 = reach the soft limit (joint_limit only)
+  mode: symmetric          # symmetric (a=0->default) | asymmetric (a=0->midpoint)   (joint_limit only)
+
+# General dot-path escape hatch: {"sim.dt": 0.004, "scene.robot.actuators.legs.stiffness": 200.0}
+cfg_overrides: null
