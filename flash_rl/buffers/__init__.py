@@ -5,8 +5,19 @@ import gymnasium as gym
 from ..types import NDArray
 from .base_buffer import BaseBuffer, Batch  # noqa
 from .numpy_buffer import NpyUniformBuffer
+from .torch_buffer import (
+    TorchGeometricBuffer,
+    TorchUniformBuffer,
+)
 
-__all__ = ["BaseBuffer", "Batch", "NpyUniformBuffer", "create_buffer"]
+__all__ = [
+    "BaseBuffer",
+    "Batch",
+    "NpyUniformBuffer",
+    "TorchUniformBuffer",
+    "TorchGeometricBuffer",
+    "create_buffer",
+]
 
 
 def create_buffer(
@@ -37,6 +48,24 @@ def create_buffer(
     elif buffer_class_type == "jax":
         raise NotImplementedError
     elif buffer_class_type == "torch":
-        raise NotImplementedError
+        common = dict(
+            observation_space=observation_space,
+            action_space=action_space,
+            n_step=n_step,
+            gamma=gamma,
+            max_length=max_length,
+            min_length=min_length,
+            sample_batch_size=sample_batch_size,
+            device_type=kwargs["device_type"],
+        )
+        if buffer_type == "uniform":
+            return TorchUniformBuffer(**common)
+        elif buffer_type in ("geometric", "exponential"):
+            return TorchGeometricBuffer(
+                **common,
+                geom_alpha=kwargs.get("geom_alpha", 10.0),
+            )
+        else:
+            raise NotImplementedError(f"Unknown torch buffer_type: {buffer_type}")
     else:
         raise ValueError(f"Invalid buffer class type: {buffer_class_type}")
