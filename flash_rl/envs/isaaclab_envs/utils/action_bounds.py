@@ -11,9 +11,11 @@ def compute_joint_limit_action_bound(
     action_scale: torch.Tensor,
     fraction: float = 1.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Build an asymmetric affine action window from soft joint limits.
+    """Build a zero-centered action window from joint limits.
 
     The IsaacLab ``JointPositionAction`` target is ``default + scale * action``.
+    Following Holosoma FastSAC, action zero should keep the default pose, while
+    ``range`` reaches the farther joint limit from the default pose.
     This returns ``(bias, range)`` for ``final = bias + range * tanh_action``.
     """
     if not 0.0 <= fraction <= 1.0:
@@ -24,13 +26,10 @@ def compute_joint_limit_action_bound(
     zero = action_scale.abs() < 1e-8
     safe_scale = torch.where(zero, torch.ones_like(action_scale), action_scale)
 
-    action_to_lower = fraction * (lower - default_pos) / safe_scale
-    action_to_upper = fraction * (upper - default_pos) / safe_scale
-    action_low = torch.minimum(action_to_lower, action_to_upper)
-    action_high = torch.maximum(action_to_lower, action_to_upper)
-    action_bias = 0.5 * (action_high + action_low)
-    action_range = 0.5 * (action_high - action_low)
+    range_to_lower = torch.abs(lower - default_pos)
+    range_to_upper = torch.abs(upper - default_pos)
+    action_range = fraction * torch.maximum(range_to_lower, range_to_upper) / safe_scale.abs()
+    action_bias = torch.zeros_like(action_range)
 
-    action_bias = torch.where(zero, torch.zeros_like(action_bias), action_bias)
     action_range = torch.where(zero, torch.zeros_like(action_range), action_range)
     return action_bias, action_range
