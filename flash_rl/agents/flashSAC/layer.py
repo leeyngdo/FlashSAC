@@ -24,6 +24,15 @@ class UnitLinear(nn.Module):
         self.w.weight.copy_(F.normalize(self.w.weight, dim=-1, eps=1e-8))
 
 
+class PolicyHeadLinear(nn.Module):
+    def __init__(self, input_dim: int, output_dim: int):
+        super().__init__()
+        self.w = nn.Linear(input_dim, output_dim, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.w(x)  # type: ignore[no-any-return]
+
+
 class UnitBatchNorm(nn.Module):
     running_mean: torch.Tensor
     running_var: torch.Tensor
@@ -115,15 +124,17 @@ class NormalTanhPolicy(nn.Module):
         action_dim: int,
         action_bias: torch.Tensor,
         action_range: torch.Tensor,
-        log_std_min: float = -10.0,
-        log_std_max: float = 2.0,
+        log_std_min: float = -5.0,
+        log_std_max: float = 0.0,
     ):
         super().__init__()
-        self.mean_w = UnitLinear(hidden_dim, action_dim)
+        self.mean_w = PolicyHeadLinear(hidden_dim, action_dim)
         self.mean_bias = nn.Parameter(torch.zeros(action_dim))
 
-        self.std_w = UnitLinear(hidden_dim, action_dim)
+        self.std_w = PolicyHeadLinear(hidden_dim, action_dim)
         self.std_bias = nn.Parameter(torch.zeros(action_dim))
+        nn.init.normal_(self.mean_w.w.weight, mean=0.0, std=1e-3)
+        nn.init.zeros_(self.std_w.w.weight)
 
         self.log_std_min = log_std_min
         self.log_std_max = log_std_max
