@@ -27,7 +27,7 @@ reward:
   motion_body_ori:          {weight: 1.0, std: 0.4}
   motion_body_lin_vel:      {weight: 1.0, std: 1.0}
   motion_body_ang_vel:      {weight: 1.0, std: 3.14}
-  action_rate_l2:           {weight: -1.0}
+  action_rate_l2:           {weight: -0.1}
   joint_limit:              {weight: -10.0}
   undesired_contacts:       {weight: -0.1}
 
@@ -56,9 +56,8 @@ robot:
 
 # Action bound.
 action_bound:
-  type: scalar             # scalar | joint_limit
+  type: joint_limit        # scalar | joint_limit
   fraction: 1.0            # joint_limit only
-  mode: symmetric          # symmetric | asymmetric (joint_limit only)
 
 # Dot-path overrides applied last.
 cfg_overrides: null

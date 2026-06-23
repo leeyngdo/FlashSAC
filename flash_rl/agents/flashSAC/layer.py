@@ -113,6 +113,8 @@ class NormalTanhPolicy(nn.Module):
         self,
         hidden_dim: int,
         action_dim: int,
+        action_bias: torch.Tensor,
+        action_range: torch.Tensor,
         log_std_min: float = -10.0,
         log_std_max: float = 2.0,
     ):
@@ -125,6 +127,10 @@ class NormalTanhPolicy(nn.Module):
 
         self.log_std_min = log_std_min
         self.log_std_max = log_std_max
+        safe_action_range = torch.clamp(action_range.abs(), min=1e-6)
+        self.register_buffer("action_bias", action_bias.float(), persistent=False)
+        self.register_buffer("action_range", action_range.float(), persistent=False)
+        self.register_buffer("log_action_range", torch.log(safe_action_range).sum(), persistent=False)
 
     def get_mean_and_std(
         self,
@@ -151,14 +157,16 @@ class NormalTanhPolicy(nn.Module):
         dist = torch.distributions.Normal(mean, std)
         raw_action = dist.rsample()
         tanh_action = torch.tanh(raw_action)
+        action = self.action_bias + self.action_range * tanh_action
 
         # Compute log probability (accounting for tanh via Jacobian correction)
         log_prob = dist.log_prob(raw_action)  # type: ignore[no-untyped-call]
         log_prob = log_prob - safe_tanh_log_det_jacobian(raw_action)
         log_prob = log_prob.sum(1)
+        log_prob = log_prob - self.log_action_range
 
         info: dict[str, torch.Tensor] = {"log_prob": log_prob}
-        return tanh_action, info
+        return action, info
 
 
 # -------------------------------------

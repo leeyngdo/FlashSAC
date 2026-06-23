@@ -154,21 +154,23 @@ class IsaacLabVectorEnv(
             self.observation_space = batch_space(self.single_observation_space, self.num_envs)
 
         self.action_size = cast(Any, self.envs.unwrapped).single_action_space.shape
-        self._action_bias: torch.Tensor | None = None
-        self._action_range: torch.Tensor | None = None
+        self._action_low = torch.full(self.action_size, -float(action_bounds), device=self.device)
+        self._action_high = torch.full(self.action_size, float(action_bounds), device=self.device)
         action_bound = omegaconf_to_plain(action_bound)
         if isinstance(action_bound, dict) and action_bound.get("type") == "joint_limit":
-            # NOTE: The actor still outputs normalized actions; step() maps them to the joint-limit window.
-            self.action_bounds = None
-            self._action_bias, self._action_range = self._build_joint_limit_bound(
+            action_bias, action_range = self._build_joint_limit_bound(
                 fraction=float(action_bound.get("fraction", 1.0)),
-                mode=str(action_bound.get("mode", "asymmetric")),
             )
-            self.single_action_space = gym.spaces.Box(low=-1.0, high=1.0, shape=self.action_size, dtype=np.float32)
-        else:
-            self.action_bounds = action_bounds
+            self._action_low = action_bias - action_range
+            self._action_high = action_bias + action_range
             self.single_action_space = gym.spaces.Box(
-                low=-1.0 * self.action_bounds, high=1.0 * self.action_bounds, shape=self.action_size, dtype=np.float32
+                low=self._action_low.cpu().numpy(),
+                high=self._action_high.cpu().numpy(),
+                dtype=np.float32,
+            )
+        else:
+            self.single_action_space = gym.spaces.Box(
+                low=-1.0 * float(action_bounds), high=float(action_bounds), shape=self.action_size, dtype=np.float32
             )
         self.action_space = batch_space(self.single_action_space, self.num_envs)
 
@@ -192,7 +194,7 @@ class IsaacLabVectorEnv(
             self._final_obs_buf[k][env_ids] = v[env_ids]
         return orig_reset_idx(env_ids, *args, **kwargs)
 
-    def _build_joint_limit_bound(self, fraction: float, mode: str) -> tuple[torch.Tensor, torch.Tensor]:
+    def _build_joint_limit_bound(self, fraction: float) -> tuple[torch.Tensor, torch.Tensor]:
         """Build the per-joint (bias, range) affine from the live robot joint limits + action scale.
 
         Reads the soft joint position limits and default joint positions from the robot, and the
@@ -215,7 +217,7 @@ class IsaacLabVectorEnv(
         scale = scale.reshape(-1)
         if scale.numel() == 1:
             scale = scale.expand(soft.shape[0])
-        bias, rng = compute_joint_limit_action_bound(soft, default, scale, fraction=fraction, mode=mode)
+        bias, rng = compute_joint_limit_action_bound(soft, default, scale, fraction=fraction)
         return bias.to(self.device).float(), rng.to(self.device).float()
 
     def reset(
@@ -262,10 +264,7 @@ class IsaacLabVectorEnv(
         else:
             torch_actions = torch.from_numpy(actions).to(self.device)
 
-        if self._action_bias is not None:
-            torch_actions = self._action_bias + self._action_range * torch.clamp(torch_actions, -1.0, 1.0)
-        elif self.action_bounds is not None:
-            torch_actions = torch.clamp(torch_actions, -1.0, 1.0) * self.action_bounds
+        torch_actions = torch.clamp(torch_actions, self._action_low, self._action_high)
         obs_dict, rew, terminations, truncations, raw_infos = cast(Any, self.envs.step(torch_actions))
         obs = obs_dict["policy"]
         if self.asymmetric_obs:

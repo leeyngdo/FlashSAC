@@ -1,8 +1,13 @@
 # ruff: noqa: E402  (IsaacLab scripts must import isaaclab.* only after AppLauncher is created)
-"""Convert a retargeted LAFAN1 CSV motion to a tracking-task ``.npz``.
+"""Convert a retargeted motion to a tracking-task ``.npz``.
+
+Accepts either:
+  * a Unitree-convention CSV: root_pos[3] + root_quat[4, xyzw] + 29 G1 joints (e.g. LAFAN1), or
+  * an ASAP / PBHC / HuB joblib ``.pkl`` (single-key dict with root_trans_offset / root_rot[xyzw] /
+    dof[23 wrist-frozen | 29] / fps), which is expanded to the 29-DoF G1 order (wrists zero-filled).
 
 Adapted from HybridRobotics/whole_body_tracking ``scripts/csv_to_npz.py`` (BSD-3-Clause).
-Requires Isaac Sim / Isaac Lab for forward kinematics.
+Requires Isaac Sim / Isaac Lab for forward kinematics; ``.pkl`` input additionally needs ``joblib``.
 """
 
 import argparse
@@ -97,26 +102,78 @@ class MotionLoader:
         self._compute_velocities()
 
     def _load_motion(self):
-        if self.frame_range is None:
-            motion = torch.from_numpy(np.loadtxt(self.motion_file, delimiter=","))
+        if self.motion_file.endswith(".pkl"):
+            motion = self._load_pkl_motion()
+        elif self.frame_range is None:
+            motion = torch.from_numpy(np.loadtxt(self.motion_file, delimiter=",")).to(torch.float32).to(self.device)
         else:
-            motion = torch.from_numpy(
-                np.loadtxt(
-                    self.motion_file,
-                    delimiter=",",
-                    skiprows=self.frame_range[0] - 1,
-                    max_rows=self.frame_range[1] - self.frame_range[0] + 1,
+            motion = (
+                torch.from_numpy(
+                    np.loadtxt(
+                        self.motion_file,
+                        delimiter=",",
+                        skiprows=self.frame_range[0] - 1,
+                        max_rows=self.frame_range[1] - self.frame_range[0] + 1,
+                    )
                 )
+                .to(torch.float32)
+                .to(self.device)
             )
-        motion = motion.to(torch.float32).to(self.device)
+        # Columns: root_pos[3] + root_quat[4, xyzw] + dof[29].
         self.motion_base_poss_input = motion[:, :3]
-        self.motion_base_rots_input = motion[:, 3:7]
-        self.motion_base_rots_input = self.motion_base_rots_input[:, [3, 0, 1, 2]]  # xyzw -> wxyz
+        self.motion_base_rots_input = motion[:, 3:7][:, [3, 0, 1, 2]]  # xyzw -> wxyz
         self.motion_dof_poss_input = motion[:, 7:]
 
         self.input_frames = motion.shape[0]
         self.duration = (self.input_frames - 1) * self.input_dt
         print(f"Motion loaded ({self.motion_file}), duration: {self.duration} sec, frames: {self.input_frames}")
+
+    def _load_pkl_motion(self) -> torch.Tensor:
+        """Load an ASAP / PBHC / HuB joblib ``.pkl`` and return a ``(T, 36)`` tensor in the CSV layout.
+
+        These motions store a single-key dict whose value holds ``root_trans_offset (T, 3)``,
+        ``root_rot (T, 4, xyzw)``, ``dof (T, 23|29)`` and ``fps``. The 23-DoF (wrist-frozen) variants
+        are expanded to the full 29-DoF G1 order with the six wrist joints zero-filled. The output
+        columns (``root_pos[3] + root_quat[4, xyzw] + dof[29]``) match the CSV layout, so the shared
+        downstream code (xyzw->wxyz reorder, slicing) is reused unchanged. ``fps`` from the pkl
+        overrides ``--input_fps`` when present.
+        """
+        import joblib
+
+        data = joblib.load(self.motion_file)
+        clip = data[next(iter(data))] if isinstance(data, dict) and "dof" not in data else data
+        root_pos = np.asarray(clip["root_trans_offset"], dtype=np.float32)  # (T, 3) meters
+        root_quat = np.asarray(clip["root_rot"], dtype=np.float32)  # (T, 4) xyzw
+        dof = self._expand_dof_to_29(np.asarray(clip["dof"], dtype=np.float32))  # (T, 29)
+
+        fps = clip.get("fps") if isinstance(clip, dict) else None
+        if fps is not None and int(fps) != self.input_fps:
+            print(f"[INFO] pkl fps={int(fps)} overrides --input_fps={self.input_fps}")
+            self.input_fps = int(fps)
+            self.input_dt = 1.0 / self.input_fps
+
+        motion = np.concatenate([root_pos, root_quat, dof], axis=1)  # (T, 36), xyzw
+        if self.frame_range is not None:
+            motion = motion[self.frame_range[0] - 1 : self.frame_range[1]]
+        return torch.from_numpy(motion).to(torch.float32).to(self.device)
+
+    @staticmethod
+    def _expand_dof_to_29(dof: np.ndarray) -> np.ndarray:
+        """Expand a 23-DoF (wrist-frozen) G1 motion to the full 29-DoF order (wrists zero-filled).
+
+        23-DoF source order: legs[0:12], waist[12:15], left_shoulder(3)+left_elbow[15:19],
+        right_shoulder(3)+right_elbow[19:23]. The 29-DoF target inserts left_wrist (19:22) and
+        right_wrist (26:29) as zeros (the source freezes the wrists).
+        """
+        n_dof = dof.shape[1]
+        if n_dof == 29:
+            return dof
+        if n_dof != 23:
+            raise ValueError(f"Unsupported dof width {n_dof}; expected 23 (wrist-frozen) or 29.")
+        out = np.zeros((dof.shape[0], 29), dtype=dof.dtype)
+        out[:, 0:19] = dof[:, 0:19]  # legs(12) + waist(3) + left shoulder(3) + left elbow(1)
+        out[:, 22:26] = dof[:, 19:23]  # right shoulder(3) + right elbow(1); wrists 19-21, 26-28 stay 0
+        return out
 
     def _interpolate_motion(self):
         times = torch.arange(0, self.duration, self.output_dt, device=self.device, dtype=torch.float32)
