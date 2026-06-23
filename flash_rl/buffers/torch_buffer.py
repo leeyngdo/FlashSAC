@@ -226,3 +226,125 @@ class TorchUniformBuffer(BaseBuffer):
 
     def get_observations(self) -> torch.Tensor:
         return self._observations[: self._num_in_buffer]
+
+
+class TorchExponentialSampler:
+    """
+    Samples recency positions {0,...,size-1} with probability proportional to
+    base^i = 2^(k*i), i.e. exponentially biased toward the newest transitions
+    (i = size-1). Truncated-Geometric / "GEOM" sampler. geom_alpha == 0.0 => uniform.
+
+    Mirrors NpyUniformBuffer.ExponentialSampler exactly, on the given device.
+    """
+
+    def __init__(self, geom_alpha: float, max_steps: int, device: torch.device):
+        if geom_alpha < 0.0:
+            raise ValueError("geom_alpha must be non-negative")
+        if max_steps <= 0:
+            raise ValueError("max_steps must be positive")
+        self.geom_alpha = float(geom_alpha)
+        self.max_steps = max_steps
+        self.device = device
+        # fp64 scalars - precision-critical: base^size with base ~= 1+1e-5 and
+        # size ~= 1e6 is catastrophically lossy in fp32, so keep these as Python floats.
+        self.k = self.geom_alpha / max_steps  # exponential rate
+        self.base = 2.0**self.k  # 2^k
+        self.denom = self.base - 1.0  # base - 1
+        self.size = 0  # updated externally on add()
+        self.Z = 1.0  # normalization constant, updated externally on add()
+
+    def compute_Z(self, size: int) -> float:
+        """Finite geometric sum sum_{i=0}^{size-1} base^i, computed in float64."""
+        if size <= 0:
+            return 1.0
+        if self.denom == 0.0:  # alpha == 0 => base == 1 => uniform; Z == size
+            return float(size)
+        return (self.base**size - 1.0) / self.denom
+
+    def _sample_recency(self, num_samples: int) -> torch.Tensor:
+        """CDF-inversion sampling of recency positions in [0, size-1], on device."""
+        # r ~ U[0, Z). Drawn in fp32 (cheap on GPU), scaled by the fp64-correct Z.
+        r = torch.rand(num_samples, device=self.device, dtype=torch.float32) * float(self.Z)
+        # inside = base^(i+1) in [1, base^size]; small number => fp32 is fine here.
+        inside = 1.0 + r * float(self.denom)
+        # i = log2(inside) / k - 1   (closed-form inverse CDF)
+        i = torch.log2(inside) / float(self.k) - 1.0
+        i = torch.floor(i).to(torch.int64)
+        return i.clamp_(0, self.size - 1)
+
+    def sample(self, batch_size: int) -> torch.Tensor:
+        """Return a (batch_size,) int64 tensor of recency positions on device."""
+        if self.denom == 0.0:
+            # uniform fast path - identical distribution to TorchUniformBuffer.sample()
+            return torch.randint(0, self.size, (batch_size,), device=self.device)
+        return self._sample_recency(batch_size)
+
+
+class TorchGeometricBuffer(TorchUniformBuffer):
+    """
+    Truncated-Geometric ("GEOM" / exponential) replay buffer.
+
+    Identical storage / add path to TorchUniformBuffer; only the sampling
+    distribution over recency positions changes. geom_alpha == 0.0 => uniform.
+    Mirrors NpyUniformBuffer with an ExponentialSampler.
+    """
+
+    def __init__(
+        self,
+        observation_space: gym.spaces.Space[NDArray],
+        action_space: gym.spaces.Space[NDArray],
+        n_step: int,
+        gamma: float,
+        max_length: int,
+        min_length: int,
+        sample_batch_size: int,
+        device_type: str,
+        geom_alpha: float = 10.0,
+    ):
+        self._geom_alpha = geom_alpha
+        # reset() is called inside super().__init__ (TorchUniformBuffer.__init__).
+        super().__init__(
+            observation_space,
+            action_space,
+            n_step,
+            gamma,
+            max_length,
+            min_length,
+            sample_batch_size,
+            device_type,
+        )
+
+    def reset(self) -> None:
+        super().reset()
+        # _device is set by TorchUniformBuffer.__init__ before reset() is called.
+        self.sampler = TorchExponentialSampler(
+            geom_alpha=self._geom_alpha,
+            max_steps=self._max_length,
+            device=self._device,
+        )
+        self.sampler.size = 0
+        self.sampler.Z = 1.0
+
+    def add(self, transition: Batch) -> None:
+        super().add(transition)
+        # After super().add advances _num_in_buffer, refresh the sampler size / Z.
+        # compute_Z is O(1); the guard short-circuits once the buffer is full.
+        if self.sampler.size != self._num_in_buffer:
+            self.sampler.size = self._num_in_buffer
+            self.sampler.Z = self.sampler.compute_Z(self._num_in_buffer)
+
+    def sample(self, sample_idxs: Optional[NDArray] = None) -> Batch:
+        if sample_idxs is None:
+            recency_idxs = self.sampler.sample(self._sample_batch_size)  # int64, device, 0..size-1
+            # recency (0=oldest) -> absolute ring index, re-anchored to the live window.
+            sample_idxs = (self._current_idx - self._num_in_buffer + recency_idxs).remainder(self._max_length)
+        return super().sample(sample_idxs=sample_idxs)
+
+    def load(self, path: str) -> None:
+        # TorchUniformBuffer.load restores _num_in_buffer / _current_idx but not the
+        # sampler's size / Z (which are only refreshed on add()). Refresh them here so a
+        # sample() issued after load() but before the next add() (e.g. a resumed run that
+        # updates before collecting) maps recency to the correct ring window.
+        super().load(path)
+        self.sampler.size = self._num_in_buffer
+        self.sampler.Z = self.sampler.compute_Z(self._num_in_buffer)
