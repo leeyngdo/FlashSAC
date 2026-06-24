@@ -27,6 +27,24 @@ _UNDESIRED_CONTACT_REGEX = (
     r"(?!left_wrist_yaw_link$)(?!right_wrist_yaw_link$).+$"
 )
 
+_END_EFFECTOR_BODY_NAMES = [
+    "left_wrist_yaw_link",
+    "right_wrist_yaw_link",
+    "left_ankle_roll_link",
+    "right_ankle_roll_link",
+]
+_END_EFFECTOR_BODY_OFFSETS = [
+    [0.18, -0.025, 0.0],
+    [0.18, 0.025, 0.0],
+    [0.0, 0.0, 0.0],
+    [0.0, 0.0, 0.0],
+]
+_ANTI_SHAKE_BODY_NAMES = [
+    "left_wrist_yaw_link",
+    "right_wrist_yaw_link",
+    "head_link",
+]
+
 
 @configclass
 class RewardsCfg:
@@ -48,6 +66,17 @@ class RewardsCfg:
         weight=2.0,
         params={"command_name": "motion", "std": 0.3},
     )
+    motion_ee_body_pos = RewTerm(
+        func=mdp.motion_local_body_position_error_exp,
+        weight=2.0,
+        params={
+            "command_name": "motion",
+            "std": 0.1,
+            "body_names": _END_EFFECTOR_BODY_NAMES,
+            "body_offsets": _END_EFFECTOR_BODY_OFFSETS,
+            "anchor_body_name": "pelvis",
+        },
+    )
     motion_body_ori = RewTerm(
         func=mdp.motion_relative_body_orientation_error_exp,
         weight=1.0,
@@ -65,6 +94,16 @@ class RewardsCfg:
     )
     # --- Regularization ---
     action_rate_l2 = RewTerm(func=mdp.action_rate_l2, weight=-1.0)
+    anti_shake_ang_vel = RewTerm(
+        func=mdp.anti_shake_ang_vel_l2,
+        weight=-5.0e-3,
+        params={"command_name": "motion", "threshold": 1.5, "body_names": _ANTI_SHAKE_BODY_NAMES},
+    )
+    feet_acc = RewTerm(
+        func=mdp.joint_acc_l2,
+        weight=-2.5e-7,
+        params={"asset_cfg": SceneEntityCfg("robot", joint_names=[".*ankle.*"])},
+    )
     joint_limit = RewTerm(
         func=mdp.joint_pos_limits,
         weight=-10.0,

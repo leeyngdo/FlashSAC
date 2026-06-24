@@ -24,10 +24,13 @@ reward:
   motion_global_anchor_pos: {weight: 1.0, std: 0.3}
   motion_global_anchor_ori: {weight: 0.5, std: 0.4}
   motion_body_pos:          {weight: 2.0, std: 0.3}
+  motion_ee_body_pos:       {weight: 2.0, std: 0.1}
   motion_body_ori:          {weight: 1.0, std: 0.4}
   motion_body_lin_vel:      {weight: 1.0, std: 1.0}
   motion_body_ang_vel:      {weight: 1.0, std: 3.14}
   action_rate_l2:           {weight: -0.1}
+  anti_shake_ang_vel:       {weight: -5.0e-3, threshold: 1.5}
+  feet_acc:                 {weight: -2.5e-7}
   joint_limit:              {weight: -10.0}
   undesired_contacts:       {weight: -0.1}
 

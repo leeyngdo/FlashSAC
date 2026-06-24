@@ -10,7 +10,7 @@ from __future__ import annotations
 import torch
 from typing import TYPE_CHECKING
 
-from isaaclab.utils.math import quat_error_magnitude
+from isaaclab.utils.math import quat_apply, quat_error_magnitude, quat_inv
 
 from ..cmds.motion_command import MotionCommand
 
@@ -83,6 +83,96 @@ def motion_relative_body_position_error_exp(
         torch.square(command.body_pos_relative_w[:, body_indexes] - command.robot_body_pos_w[:, body_indexes]), dim=-1
     )
     return torch.exp(-error.mean(-1) / std**2)
+
+
+def motion_local_body_position_error_exp(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    std: float,
+    body_names: list[str] | None = None,
+    body_offsets: list[list[float]] | None = None,
+    anchor_body_name: str | None = None,
+) -> torch.Tensor:
+    """Exponential reward on anchor-local body point position error.
+
+    Args:
+        env: The environment instance.
+        command_name: The name of the motion command term.
+        std: The standard deviation of the exponential kernel.
+        body_names: The bodies to track, or ``None`` to track all bodies.
+        body_offsets: The local point offsets for each tracked body, or ``None`` to use body origins.
+        anchor_body_name: The body frame used as the local anchor, or ``None`` to use the command anchor.
+
+    Returns:
+        The reward of shape ``(num_envs,)``.
+    """
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    body_indexes = _get_body_indexes(command, body_names)
+    if not body_indexes:
+        raise ValueError(f"No body names matched reward body_names={body_names!r}")
+
+    num_bodies = len(body_indexes)
+    selected_body_names = [command.cfg.body_names[i] for i in body_indexes]
+    if body_offsets is None:
+        offsets = torch.zeros((1, num_bodies, 3), dtype=command.body_pos_w.dtype, device=command.body_pos_w.device)
+    else:
+        if body_names is None:
+            ordered_offsets = body_offsets
+        else:
+            offset_by_name = dict(zip(body_names, body_offsets, strict=True))
+            ordered_offsets = [offset_by_name[name] for name in selected_body_names]
+        offsets = torch.tensor(ordered_offsets, dtype=command.body_pos_w.dtype, device=command.body_pos_w.device).view(
+            1, num_bodies, 3
+        )
+    offsets = offsets.expand(command.body_pos_w.shape[0], -1, -1)
+
+    ref_pos_w = command.body_pos_w[:, body_indexes] + quat_apply(command.body_quat_w[:, body_indexes], offsets)
+    robot_pos_w = command.robot_body_pos_w[:, body_indexes] + quat_apply(
+        command.robot_body_quat_w[:, body_indexes], offsets
+    )
+
+    if anchor_body_name is None:
+        ref_anchor_pos_w = command.anchor_pos_w
+        ref_anchor_quat_w = command.anchor_quat_w
+        robot_anchor_pos_w = command.robot_anchor_pos_w
+        robot_anchor_quat_w = command.robot_anchor_quat_w
+    else:
+        anchor_index = command.cfg.body_names.index(anchor_body_name)
+        ref_anchor_pos_w = command.body_pos_w[:, anchor_index]
+        ref_anchor_quat_w = command.body_quat_w[:, anchor_index]
+        robot_anchor_pos_w = command.robot_body_pos_w[:, anchor_index]
+        robot_anchor_quat_w = command.robot_body_quat_w[:, anchor_index]
+
+    ref_anchor_quat_w = ref_anchor_quat_w[:, None, :].repeat(1, num_bodies, 1)
+    robot_anchor_quat_w = robot_anchor_quat_w[:, None, :].repeat(1, num_bodies, 1)
+
+    ref_pos_local = quat_apply(quat_inv(ref_anchor_quat_w), ref_pos_w - ref_anchor_pos_w[:, None, :])
+    robot_pos_local = quat_apply(quat_inv(robot_anchor_quat_w), robot_pos_w - robot_anchor_pos_w[:, None, :])
+    error = torch.sum(torch.square(robot_pos_local - ref_pos_local), dim=-1)
+    return torch.exp(-error.mean(-1) / std**2)
+
+
+def anti_shake_ang_vel_l2(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    threshold: float = 1.5,
+    body_names: list[str] | None = None,
+) -> torch.Tensor:
+    """Penalty on excessive selected-body angular velocity.
+
+    Args:
+        env: The environment instance.
+        command_name: The name of the motion command term.
+        threshold: The angular-velocity deadzone in rad/s.
+        body_names: The bodies to penalize, or ``None`` to penalize all bodies.
+
+    Returns:
+        The penalty of shape ``(num_envs,)``.
+    """
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    body_indexes = _get_body_indexes(command, body_names)
+    speed = torch.linalg.norm(command.robot_body_ang_vel_w[:, body_indexes], dim=-1)
+    return torch.square(torch.relu(speed - threshold)).mean(dim=-1)
 
 
 def motion_relative_body_orientation_error_exp(

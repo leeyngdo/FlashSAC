@@ -103,8 +103,9 @@ def _apply_reward_overrides(env_cfg: Any, reward: dict[str, Any] | None) -> None
             continue
         if term_cfg.get("weight") is not None:
             term.weight = term_cfg["weight"]
-        if term_cfg.get("std") is not None:
-            term.params["std"] = term_cfg["std"]
+        for key, value in term_cfg.items():
+            if key not in ("enabled", "weight") and value is not None:
+                term.params[key] = value
 
 
 def _apply_observation_overrides(env_cfg: Any, observation: dict[str, Any] | None) -> None:

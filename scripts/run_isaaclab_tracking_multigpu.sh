@@ -1,7 +1,18 @@
 #!/bin/bash
 ##################################################################################
-# IsaacLab Motion Tracking (GPU Simulator)
+# IsaacLab Motion Tracking - Multi-GPU (data-parallel) training
+#
+# Launches one process per GPU with torchrun. Each rank runs the full num_train_envs
+# on its own GPU with its own replay buffer; gradients are averaged across ranks.
+# Therefore, with N GPUs the effective envs/batch scale by N:
+#   - effective envs       = num_train_envs * N
+#   - effective batch size = sample_batch_size * N
+# `num_env_steps` remains the global env-step budget; train.py divides interaction
+# steps across ranks. Learning rate is NOT scaled.
 ##################################################################################
+
+# Number of GPUs to use (defaults to all visible GPUs).
+NUM_GPUS=${NUM_GPUS:-$(python -c "import torch; print(torch.cuda.device_count())")}
 
 # Hydra list literal syntax: ["/path/a.npz","/path/b.npz"] or a directory "/path/motions".
 MOTION_FILES='[/home/ubuntu/youngdo/FlashSAC/flash_rl/envs/isaaclab_envs/motions/TODO_REPLACE_ME.npz]'
@@ -9,7 +20,7 @@ MOTION_FILES='[/home/ubuntu/youngdo/FlashSAC/flash_rl/envs/isaaclab_envs/motions
 seeds=( 0 1000 2000 3000 4000 )
 
 for seed in "${seeds[@]}"; do
-    uv run python train.py \
+    uv run torchrun --standalone --nnodes=1 --nproc_per_node="${NUM_GPUS}" train.py \
         --config_name flashSAC_base \
         --overrides seed=${seed} \
         --overrides env=isaaclab_tracking \

@@ -6,6 +6,6 @@ through the local reward registry and the per-group override layer.
 
 from __future__ import annotations
 
-from isaaclab.envs.mdp import action_rate_l2, joint_pos_limits
+from isaaclab.envs.mdp import action_rate_l2, joint_acc_l2, joint_pos_limits
 
-__all__ = ["action_rate_l2", "joint_pos_limits"]
+__all__ = ["action_rate_l2", "joint_acc_l2", "joint_pos_limits"]
