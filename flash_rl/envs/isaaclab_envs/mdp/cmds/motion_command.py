@@ -425,7 +425,7 @@ class MotionCommand(CommandTerm):
 
 
 def _sphere_marker_cfg(radius: float, color: tuple[float, float, float]) -> VisualizationMarkersCfg:
-    """Single-sphere VisualizationMarkers cfg for KraftonLab-style reference-motion viz."""
+    """Single-sphere VisualizationMarkers cfg for reference-motion visualization."""
     return VisualizationMarkersCfg(
         prim_path="/Visuals/Command/pose",
         markers={

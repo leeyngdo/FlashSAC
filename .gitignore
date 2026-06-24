@@ -172,5 +172,3 @@ flash_rl/envs/isaaclab_envs/motions/lafan1_csv/
 runs/
 *.mp4
 .claude/
-# internal framework reference (separate repo — never commit here)
-KraftonLab/
