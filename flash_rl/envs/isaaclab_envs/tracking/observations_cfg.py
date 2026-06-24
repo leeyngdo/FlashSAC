@@ -1,4 +1,4 @@
-"""Observation configuration for the G1 motion-tracking task.
+"""Observation configuration for the motion-tracking task.
 
 Observation term functions are looked up from the :data:`...mdp.OBS_TERMS`
 registry by name, so adding a new observation is a 3-step recipe: write the func

@@ -1,4 +1,4 @@
-"""Termination configuration for the G1 motion-tracking task.
+"""Termination configuration for the motion-tracking task.
 
 Note the func-vs-field indirection (matching WBT): the ``anchor_pos`` cfg field
 uses the ``bad_anchor_pos_z_only`` func and ``ee_body_pos`` uses the
@@ -33,11 +33,6 @@ class TerminationsCfg:
         params={
             "command_name": "motion",
             "threshold": 0.25,
-            "body_names": [
-                "left_ankle_roll_link",
-                "right_ankle_roll_link",
-                "left_wrist_yaw_link",
-                "right_wrist_yaw_link",
-            ],
+            "body_names": None,
         },
     )

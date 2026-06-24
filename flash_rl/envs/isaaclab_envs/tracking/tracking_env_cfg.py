@@ -1,4 +1,4 @@
-"""Assembler for the modular G1 motion-tracking environment configuration.
+"""Assembler for the modular motion-tracking environment configuration.
 
 This module wires together the per-aspect configuration classes (scene, observations,
 commands, rewards, terminations, events) that live in sibling modules into a single
@@ -37,7 +37,7 @@ class CurriculumCfg:
 
 @configclass
 class TrackingEnvCfg(ManagerBasedRLEnvCfg):
-    """Configuration for the G1 motion-tracking environment."""
+    """Configuration for the motion-tracking environment."""
 
     # Scene settings
     scene: MySceneCfg = MySceneCfg(num_envs=4096, env_spacing=2.5)

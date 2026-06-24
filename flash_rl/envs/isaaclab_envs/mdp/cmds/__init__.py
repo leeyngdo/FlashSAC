@@ -1,4 +1,4 @@
-"""Command terms for the G1 motion-tracking task."""
+"""Command terms for the motion-tracking task."""
 
 from .motion_command import MotionCommand, MotionCommandCfg
 

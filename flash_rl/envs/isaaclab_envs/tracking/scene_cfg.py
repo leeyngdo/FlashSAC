@@ -1,4 +1,4 @@
-"""Interactive scene configuration for the G1 motion-tracking task."""
+"""Interactive scene configuration for the motion-tracking task."""
 
 from __future__ import annotations
 
@@ -17,8 +17,7 @@ class MySceneCfg(InteractiveSceneCfg):
     """Configuration for the terrain scene with a legged robot.
 
     The robot articulation is left as ``MISSING`` so that the concrete robot
-    config (e.g. the vendored G1 factory output) is injected by the per-robot
-    flat env config in :mod:`...tracking.config.g1.flat_env_cfg`.
+    config is injected by the per-robot flat env config.
     """
 
     # ground terrain

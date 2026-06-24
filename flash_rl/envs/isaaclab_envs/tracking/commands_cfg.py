@@ -1,4 +1,4 @@
-"""Command configuration for the G1 motion-tracking task."""
+"""Command configuration for the motion-tracking task."""
 
 from __future__ import annotations
 

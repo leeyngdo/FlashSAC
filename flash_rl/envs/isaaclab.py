@@ -33,7 +33,8 @@ ACTION_BOUNDS = {
 
 # NOTE: Local IsaacLab tasks must be imported after AppLauncher starts IsaacSim and before parse_env_cfg.
 LOCAL_ISAACLAB_TASKS: dict[str, tuple[str, Callable[..., Any] | None]] = {
-    "Isaac-Tracking": ("flash_rl.envs.isaaclab_envs.tracking.config.g1", apply_tracking_overrides),
+    "Isaac-Tracking-Flat-G1-v0": ("flash_rl.envs.isaaclab_envs.tracking.config.g1", apply_tracking_overrides),
+    "Isaac-Tracking-Flat-G1-WoSE-v0": ("flash_rl.envs.isaaclab_envs.tracking.config.g1", apply_tracking_overrides),
 }
 
 
@@ -96,7 +97,7 @@ class IsaacLabVectorEnv(
         )
         self.simulation_app = app_launcher.app
 
-        local_task = next((task for prefix, task in LOCAL_ISAACLAB_TASKS.items() if env_name.startswith(prefix)), None)
+        local_task = LOCAL_ISAACLAB_TASKS.get(env_name)
         if local_task is not None:
             module_name, _ = local_task
             import_module(module_name)

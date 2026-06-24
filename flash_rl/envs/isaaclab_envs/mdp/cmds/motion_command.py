@@ -1,4 +1,4 @@
-"""Motion-tracking command term for the G1 tracking task.
+"""Motion-tracking command term.
 
 This module vendors the BeyondMimic ``MotionCommand``/``MotionCommandCfg`` (math and
 adaptive-sampling logic copied verbatim from ``whole_body_tracking``), with two changes:

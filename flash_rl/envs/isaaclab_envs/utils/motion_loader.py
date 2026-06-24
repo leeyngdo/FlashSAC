@@ -1,4 +1,4 @@
-"""Multi-dataset motion loader for the G1 tracking task.
+"""Multi-dataset motion loader for the tracking task.
 
 This module is import-light on purpose: it depends only on ``numpy`` and
 ``torch`` so it can be unit-tested without IsaacLab/IsaacSim installed. It must

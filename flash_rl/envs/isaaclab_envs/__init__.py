@@ -1,8 +1,9 @@
 """Vendored modular IsaacLab motion-tracking task package.
 
-This package vendors the BeyondMimic G1 tracking task (from ``whole_body_tracking``)
-into FlashSAC and keeps the task split into modular observations, reward and
-termination registries, and a multi-dataset motion loader with adaptive sampling.
+This package vendors the BeyondMimic tracking stack (from ``whole_body_tracking``)
+into FlashSAC and keeps the task split into per-robot registrations, modular
+observations, reward and termination registries, and a multi-dataset motion loader
+with adaptive sampling.
 
 This top-level ``__init__`` is intentionally import-light: it contains NO ``isaaclab``
 or ``gym`` imports and triggers NO gym registration at import time. Pure submodules
