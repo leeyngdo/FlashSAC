@@ -25,6 +25,7 @@ from flash_rl.agents.utils.network import Network
 from flash_rl.agents.utils.reward_normalization import RewardNormalizer
 from flash_rl.agents.utils.scheduler import warmup_cosine_decay_scheduler
 from flash_rl.buffers.torch_buffer import TorchUniformBuffer
+from flash_rl.common.distributed import broadcast_parameters_, resolve_device_type
 from flash_rl.types import NDArray, Tensor
 
 
@@ -359,13 +360,7 @@ class FlashSACAgent(BaseAgent[FlashSACConfig]):
         else:
             self._actor_observation_dim = self._critic_observation_dim
 
-        device_type = cfg.device_type
-        device_type = (
-            device_type
-            if device_type.startswith("cuda") and ":" in device_type
-            else ("cuda:0" if device_type.startswith("cuda") else "cpu")
-        )
-        self._device = torch.device(device_type)
+        self._device = torch.device(resolve_device_type(cfg.device_type))
 
         if not isinstance(action_space, gym.spaces.Box):
             raise TypeError(f"FlashSAC expects a Box action space, got {type(action_space).__name__}.")
@@ -412,6 +407,17 @@ class FlashSACAgent(BaseAgent[FlashSACConfig]):
             cfg=self._cfg,
             device=self._device,
         )
+        # Sync initial weights from rank 0 so every data-parallel rank starts identical.
+        # No-op when training in a single process.
+        broadcast_parameters_(
+            [
+                self._actor.network,
+                self._critic.network,
+                self._target_critic.network,
+                self._temperature.network,
+            ],
+            src=0,
+        )
         self._update_step = 0
 
         # Grad scaler for FP16 AMP
@@ -445,7 +451,7 @@ class FlashSACAgent(BaseAgent[FlashSACConfig]):
             max_length=self._cfg.buffer_max_length,
             min_length=self._cfg.buffer_min_length,
             sample_batch_size=self._cfg.sample_batch_size,
-            device_type=self._cfg.buffer_device_type,
+            device_type=resolve_device_type(self._cfg.buffer_device_type),
         )
 
     def sample_actions(

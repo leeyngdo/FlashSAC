@@ -84,10 +84,16 @@ class IsaacLabVectorEnv(
         motion: dict[str, Any] | None = None,
         cfg_overrides: dict[str, Any] | None = None,
         action_bound: dict[str, Any] | None = None,
+        distributed: bool = False,
     ):
         from isaaclab.app import AppLauncher
 
-        app_launcher = AppLauncher(headless=headless, device=device, enable_cameras=enable_cameras or not headless)
+        app_launcher = AppLauncher(
+            headless=headless,
+            device=device,
+            distributed=distributed,
+            enable_cameras=enable_cameras or not headless,
+        )
         self.simulation_app = app_launcher.app
 
         local_task = next((task for prefix, task in LOCAL_ISAACLAB_TASKS.items() if env_name.startswith(prefix)), None)
@@ -326,11 +332,16 @@ def make_isaaclab_env(
     if env_name not in ACTION_BOUNDS:
         print(f"Action bounds not defined for {env_name}; using default value 1.0.")
     action_bounds = ACTION_BOUNDS.get(env_name, 1.0)
+    # Under torchrun each rank binds its own GPU; AppLauncher honors LOCAL_RANK in distributed mode.
+    from flash_rl.common.distributed import is_distributed, local_rank
+
+    distributed = is_distributed()
+    device = f"cuda:{local_rank()}" if torch.cuda.is_available() else "cpu"
     env = IsaacLabVectorEnv(
         env_name=env_name,
         num_envs=num_envs,
         seed=seed,
-        device="cuda:0" if torch.cuda.is_available() else "cpu",
+        device=device,
         action_bounds=action_bounds,
         to_numpy=True,
         headless=headless,
@@ -342,5 +353,6 @@ def make_isaaclab_env(
         motion=motion,
         cfg_overrides=cfg_overrides,
         action_bound=action_bound,
+        distributed=distributed,
     )
     return env
