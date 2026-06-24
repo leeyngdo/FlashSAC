@@ -5,6 +5,7 @@ from torch.amp.grad_scaler import GradScaler
 
 from flash_rl.agents.utils.network import Network
 from flash_rl.buffers import Batch
+from flash_rl.common.distributed import all_reduce_grads_average_
 
 
 def add_prefix_to_keys(d: dict[str, Any], prefix: str) -> dict[str, Any]:
@@ -23,9 +24,7 @@ def _select_min_q_log_probs(
         next_q_log_probs,
         dim=0,
         index=min_indices[None, :, None].expand(1, -1, num_bins),
-    )[
-        0
-    ]  # (B, num_bins)
+    )[0]  # (B, num_bins)
     return selected
 
 
@@ -140,10 +139,15 @@ def update_actor(
     if use_amp:
         assert grad_scaler is not None
         grad_scaler.scale(actor_loss).backward()
+        # Average scaled grads before unscale so an AMP overflow on any rank is
+        # detected by every rank.
+        all_reduce_grads_average_(actor.optimizer)
+        grad_scaler.unscale_(actor.optimizer)
         grad_scaler.step(actor.optimizer)
         grad_scaler.update()
     else:
         actor_loss.backward()
+        all_reduce_grads_average_(actor.optimizer)
         actor.optimizer.step()
 
     # LR scheduler
@@ -255,10 +259,15 @@ def update_critic(
     if use_amp:
         assert grad_scaler is not None
         grad_scaler.scale(critic_loss).backward()  # type: ignore
+        # Average scaled grads before unscale so an AMP overflow on any rank is
+        # detected by every rank.
+        all_reduce_grads_average_(critic.optimizer)
+        grad_scaler.unscale_(critic.optimizer)
         grad_scaler.step(critic.optimizer)
         grad_scaler.update()
     else:
         critic_loss.backward()  # type: ignore
+        all_reduce_grads_average_(critic.optimizer)
         critic.optimizer.step()
 
     # LR scheduler
@@ -306,6 +315,7 @@ def update_temperature(
     assert temperature.optimizer is not None
     temperature.optimizer.zero_grad(set_to_none=True)
     temperature_loss.backward()
+    all_reduce_grads_average_(temperature.optimizer)
     temperature.optimizer.step()
     if temperature.scheduler is not None:
         temperature.scheduler.step()
