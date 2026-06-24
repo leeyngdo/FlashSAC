@@ -4,6 +4,23 @@ import numpy as np
 from omegaconf import OmegaConf
 
 
+class NoOpLogger:
+    """Logger that discards all metrics.
+
+    Used on non-main ranks in multi-GPU training so only rank 0 writes to wandb /
+    tensorboard.
+    """
+
+    def update_metric(self, **kwargs: Any) -> None:
+        pass
+
+    def log_metric(self, step: int) -> None:
+        pass
+
+    def reset(self) -> None:
+        pass
+
+
 class WandbTrainerLogger:
     def __init__(self, cfg: Any):
         import wandb
