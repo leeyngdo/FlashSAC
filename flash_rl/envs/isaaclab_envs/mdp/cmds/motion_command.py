@@ -122,6 +122,14 @@ class MotionCommand(CommandTerm):
         return self.motion.body_ang_vel_w[self.time_steps]
 
     @property
+    def root_pos_w(self) -> torch.Tensor:
+        return self.motion.body_pos_w[self.time_steps, 0] + self._env.scene.env_origins
+
+    @property
+    def root_quat_w(self) -> torch.Tensor:
+        return self.motion.body_quat_w[self.time_steps, 0]
+
+    @property
     def anchor_pos_w(self) -> torch.Tensor:
         return self.motion.body_pos_w[self.time_steps, self.motion_anchor_body_index] + self._env.scene.env_origins
 
@@ -160,6 +168,14 @@ class MotionCommand(CommandTerm):
     @property
     def robot_body_ang_vel_w(self) -> torch.Tensor:
         return self.robot.data.body_ang_vel_w[:, self.body_indexes]
+
+    @property
+    def robot_root_pos_w(self) -> torch.Tensor:
+        return self.robot.data.root_pos_w
+
+    @property
+    def robot_root_quat_w(self) -> torch.Tensor:
+        return self.robot.data.root_quat_w
 
     @property
     def robot_anchor_pos_w(self) -> torch.Tensor:
@@ -265,8 +281,8 @@ class MotionCommand(CommandTerm):
                 len(env_ids), balance_mode=self.cfg.balance_mode
             ).to(device=self.device)
 
-        root_pos = self.body_pos_w[:, 0].clone()
-        root_ori = self.body_quat_w[:, 0].clone()
+        root_pos = self.root_pos_w.clone()
+        root_ori = self.root_quat_w.clone()
         root_lin_vel = self.body_lin_vel_w[:, 0].clone()
         root_ang_vel = self.body_ang_vel_w[:, 0].clone()
 
@@ -322,10 +338,10 @@ class MotionCommand(CommandTerm):
         # Match Holosoma's reset-frame guard: immediately after reset, use the
         # root/pelvis frame instead of a configured child reference body.
         use_root = (self._env.episode_length_buf == 0).unsqueeze(-1)
-        ref_pos_w = torch.where(use_root, self.body_pos_w[:, 0], self.anchor_pos_w)
-        ref_quat_w = torch.where(use_root, self.body_quat_w[:, 0], self.anchor_quat_w)
-        robot_ref_pos_w = torch.where(use_root, self.robot_body_pos_w[:, 0], self.robot_anchor_pos_w)
-        robot_ref_quat_w = torch.where(use_root, self.robot_body_quat_w[:, 0], self.robot_anchor_quat_w)
+        ref_pos_w = torch.where(use_root, self.root_pos_w, self.anchor_pos_w)
+        ref_quat_w = torch.where(use_root, self.root_quat_w, self.anchor_quat_w)
+        robot_ref_pos_w = torch.where(use_root, self.robot_root_pos_w, self.robot_anchor_pos_w)
+        robot_ref_quat_w = torch.where(use_root, self.robot_root_quat_w, self.robot_anchor_quat_w)
 
         ref_pos_w_repeat = ref_pos_w[:, None, :].repeat(1, len(self.cfg.body_names), 1)
         ref_quat_w_repeat = ref_quat_w[:, None, :].repeat(1, len(self.cfg.body_names), 1)
