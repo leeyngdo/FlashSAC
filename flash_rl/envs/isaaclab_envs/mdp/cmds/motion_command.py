@@ -56,9 +56,11 @@ class MotionCommand(CommandTerm):
         self.robot: Articulation = env.scene[cfg.asset_name]
         self.robot_anchor_body_index = self.robot.body_names.index(self.cfg.anchor_body_name)
         self.motion_anchor_body_index = self.cfg.body_names.index(self.cfg.anchor_body_name)
-        self.body_indexes = torch.tensor(
-            self.robot.find_bodies(self.cfg.body_names, preserve_order=True)[0], dtype=torch.long, device=self.device
-        )
+        body_indexes, found_body_names = self.robot.find_bodies(self.cfg.body_names, preserve_order=True)
+        if len(found_body_names) != len(self.cfg.body_names):
+            missing = [name for name in self.cfg.body_names if name not in found_body_names]
+            raise ValueError(f"MotionCommand body_names are missing from robot body list: {missing}")
+        self.body_indexes = torch.tensor(body_indexes, dtype=torch.long, device=self.device)
 
         self.motion = MotionLoader(
             self.cfg.resolved_motion_files,

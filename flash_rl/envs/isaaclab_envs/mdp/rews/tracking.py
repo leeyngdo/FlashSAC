@@ -28,7 +28,20 @@ def _get_body_indexes(command: MotionCommand, body_names: list[str] | None) -> l
     Returns:
         The list of indices into ``command.cfg.body_names`` matching the request.
     """
-    return [i for i, name in enumerate(command.cfg.body_names) if (body_names is None) or (name in body_names)]
+    if body_names is None:
+        return list(range(len(command.cfg.body_names)))
+
+    requested_names = list(body_names)
+    if len(set(requested_names)) != len(requested_names):
+        duplicates = sorted({name for name in requested_names if requested_names.count(name) > 1})
+        raise ValueError(f"Duplicate reward body_names are not allowed: {duplicates}")
+
+    available_names = list(command.cfg.body_names)
+    missing = [name for name in requested_names if name not in available_names]
+    if missing:
+        raise ValueError(f"Tracking body_names are not tracked by the motion command: {missing}")
+
+    return [i for i, name in enumerate(available_names) if name in requested_names]
 
 
 def motion_global_anchor_position_error_exp(env: ManagerBasedRLEnv, command_name: str, std: float) -> torch.Tensor:
@@ -158,12 +171,12 @@ def anti_shake_ang_vel_l2(
     threshold: float = 1.5,
     body_names: list[str] | None = None,
 ) -> torch.Tensor:
-    """Penalty on excessive selected-body angular velocity.
+    """Penalty on excessive reference-relative selected-body angular velocity.
 
     Args:
         env: The environment instance.
         command_name: The name of the motion command term.
-        threshold: The angular-velocity deadzone in rad/s.
+        threshold: The angular-velocity error deadzone in rad/s.
         body_names: The bodies to penalize, or ``None`` to penalize all bodies.
 
     Returns:
@@ -171,8 +184,10 @@ def anti_shake_ang_vel_l2(
     """
     command: MotionCommand = env.command_manager.get_term(command_name)
     body_indexes = _get_body_indexes(command, body_names)
-    speed = torch.linalg.norm(command.robot_body_ang_vel_w[:, body_indexes], dim=-1)
-    return torch.square(torch.relu(speed - threshold)).mean(dim=-1)
+    error = torch.linalg.norm(
+        command.robot_body_ang_vel_w[:, body_indexes] - command.body_ang_vel_w[:, body_indexes], dim=-1
+    )
+    return torch.square(torch.relu(error - threshold)).mean(dim=-1)
 
 
 def motion_relative_body_orientation_error_exp(

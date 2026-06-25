@@ -33,17 +33,9 @@ END_EFFECTOR_BODY_NAMES = [
     "right_ankle_roll_link",
 ]
 
-END_EFFECTOR_BODY_OFFSETS = [
-    [0.18, -0.025, 0.0],
-    [0.18, 0.025, 0.0],
-    [0.0, 0.0, 0.0],
-    [0.0, 0.0, 0.0],
-]
-
 ANTI_SHAKE_BODY_NAMES = [
     "left_wrist_yaw_link",
     "right_wrist_yaw_link",
-    "head_link",
 ]
 
 FEET_JOINT_NAMES = [".*ankle.*"]
@@ -67,7 +59,6 @@ def apply_g1_tracking_profile(env_cfg: Any) -> None:
     env_cfg.commands.motion.body_names = list(TRACKED_BODY_NAMES)
 
     env_cfg.rewards.motion_ee_body_pos.params["body_names"] = list(END_EFFECTOR_BODY_NAMES)
-    env_cfg.rewards.motion_ee_body_pos.params["body_offsets"] = [list(offset) for offset in END_EFFECTOR_BODY_OFFSETS]
     env_cfg.rewards.motion_ee_body_pos.params["anchor_body_name"] = LOCAL_REWARD_ANCHOR_BODY_NAME
     env_cfg.rewards.anti_shake_ang_vel.params["body_names"] = list(ANTI_SHAKE_BODY_NAMES)
     env_cfg.rewards.feet_acc.params["asset_cfg"] = SceneEntityCfg("robot", joint_names=list(FEET_JOINT_NAMES))
