@@ -45,8 +45,9 @@ class MotionLoader:
     The per-frame property API (``joint_pos``, ``joint_vel``, ``body_pos_w``,
     ``body_quat_w``, ``body_lin_vel_w``, ``body_ang_vel_w``) matches the
     BeyondMimic ``MotionLoader`` so that :class:`MotionCommand` can index it by a
-    frame-index tensor unchanged. The ``body_*_w`` properties return only the
-    bodies selected by ``body_indexes``.
+    frame-index tensor unchanged. When a clip contains ``body_names`` or
+    ``joint_names`` metadata, arrays are reordered by name into the requested
+    robot order instead of assuming that the stored array order already matches.
 
     Attributes:
         fps: Frames per second of the (first) loaded clip.
@@ -64,19 +65,26 @@ class MotionLoader:
     def __init__(
         self,
         motion_files: str | Sequence[str],
-        body_indexes: Sequence[int] | torch.Tensor,
+        body_indexes: Sequence[int] | torch.Tensor | None = None,
         device: str = "cpu",
         balance_mode: str = "frame",
+        body_names: Sequence[str] | None = None,
+        joint_names: Sequence[str] | None = None,
     ) -> None:
         """Load and pool one or more motion clips.
 
         Args:
             motion_files: A single ``.npz`` path, a list of ``.npz`` paths, or a
                 directory containing ``.npz`` clips (globbed, sorted).
-            body_indexes: Indices selecting which bodies the ``body_*_w``
-                properties expose (in robot body order).
+            body_indexes: Fallback indices selecting which bodies the
+                ``body_*_w`` properties expose when a clip has no ``body_names``
+                metadata.
             device: Torch device for the pooled tensors.
             balance_mode: Default sampling strategy, ``"frame"`` or ``"motion"``.
+            body_names: Body names to expose in output order. Preferred over
+                ``body_indexes`` when clips contain ``body_names`` metadata.
+            joint_names: Joint names to expose in output order when clips
+                contain ``joint_names`` metadata.
 
         Raises:
             ValueError: If ``balance_mode`` is invalid or no clips are found.
@@ -88,7 +96,8 @@ class MotionLoader:
 
         self.device = device
         self.balance_mode = balance_mode
-        self._body_indexes = body_indexes
+        self.body_names = list(body_names) if body_names is not None else None
+        self.joint_names = list(joint_names) if joint_names is not None else None
 
         self.motion_files = self._resolve_motion_files(motion_files)
         if len(self.motion_files) == 0:
@@ -114,12 +123,21 @@ class MotionLoader:
 
             fps_values.append(float(np.asarray(data["fps"]).reshape(-1)[0]) if "fps" in data else float("nan"))
 
-            jp = torch.tensor(data["joint_pos"], dtype=torch.float32, device=device)
-            jv = torch.tensor(data["joint_vel"], dtype=torch.float32, device=device)
-            bp = torch.tensor(data["body_pos_w"], dtype=torch.float32, device=device)
-            bq = torch.tensor(data["body_quat_w"], dtype=torch.float32, device=device)
-            blv = torch.tensor(data["body_lin_vel_w"], dtype=torch.float32, device=device)
-            bav = torch.tensor(data["body_ang_vel_w"], dtype=torch.float32, device=device)
+            joint_indexes = self._resolve_joint_indexes(data, path)
+            body_selection = self._resolve_body_indexes(data, path, body_indexes)
+
+            joint_pos_np = data["joint_pos"]
+            joint_vel_np = data["joint_vel"]
+            if joint_indexes is not None:
+                joint_pos_np = joint_pos_np[:, joint_indexes]
+                joint_vel_np = joint_vel_np[:, joint_indexes]
+
+            jp = torch.tensor(joint_pos_np, dtype=torch.float32, device=device)
+            jv = torch.tensor(joint_vel_np, dtype=torch.float32, device=device)
+            bp = torch.tensor(data["body_pos_w"][:, body_selection], dtype=torch.float32, device=device)
+            bq = torch.tensor(data["body_quat_w"][:, body_selection], dtype=torch.float32, device=device)
+            blv = torch.tensor(data["body_lin_vel_w"][:, body_selection], dtype=torch.float32, device=device)
+            bav = torch.tensor(data["body_ang_vel_w"][:, body_selection], dtype=torch.float32, device=device)
 
             length = jp.shape[0]
             joint_pos_list.append(jp)
@@ -182,28 +200,126 @@ class MotionLoader:
                 raise FileNotFoundError(f"Motion path does not exist: {entry!r}")
         return resolved
 
+    def _resolve_joint_indexes(self, data: np.lib.npyio.NpzFile, path: str) -> list[int] | None:
+        """Resolve joint reorder indices for one clip.
+
+        Returns ``None`` when no reordering is needed.
+        """
+        joint_dim = int(data["joint_pos"].shape[1])
+        if data["joint_vel"].shape[1] != joint_dim:
+            raise ValueError(
+                f"Motion clip {path!r} has inconsistent joint dimensions: "
+                f"joint_pos={data['joint_pos'].shape}, joint_vel={data['joint_vel'].shape}."
+            )
+
+        if self.joint_names is None:
+            return None
+
+        if "joint_names" not in data:
+            if joint_dim != len(self.joint_names):
+                raise ValueError(
+                    f"Motion clip {path!r} has {joint_dim} joints but {len(self.joint_names)} names were requested, "
+                    "and the clip has no 'joint_names' metadata for name-based mapping."
+                )
+            return None
+
+        available_names = self._decode_names(data["joint_names"])
+        self._validate_name_count(available_names, joint_dim, "joint", path)
+        return self._indexes_by_name(self.joint_names, available_names, "joint", path)
+
+    def _resolve_body_indexes(
+        self,
+        data: np.lib.npyio.NpzFile,
+        path: str,
+        fallback_body_indexes: Sequence[int] | torch.Tensor | None,
+    ) -> list[int]:
+        """Resolve body reorder indices for one clip."""
+        body_dim = int(data["body_pos_w"].shape[1])
+        for key in ("body_quat_w", "body_lin_vel_w", "body_ang_vel_w"):
+            if data[key].shape[1] != body_dim:
+                raise ValueError(
+                    f"Motion clip {path!r} has inconsistent body dimensions: "
+                    f"body_pos_w={data['body_pos_w'].shape}, {key}={data[key].shape}."
+                )
+
+        if self.body_names is not None and "body_names" in data:
+            available_names = self._decode_names(data["body_names"])
+            self._validate_name_count(available_names, body_dim, "body", path)
+            return self._indexes_by_name(self.body_names, available_names, "body", path)
+
+        if fallback_body_indexes is None:
+            raise KeyError(
+                f"Motion clip {path!r} has no 'body_names' metadata and no fallback body_indexes were provided."
+            )
+
+        indexes = self._to_index_list(fallback_body_indexes)
+        if any(index < 0 or index >= body_dim for index in indexes):
+            raise IndexError(f"Motion clip {path!r} body_indexes {indexes!r} exceed body dimension {body_dim}.")
+        return indexes
+
+    @staticmethod
+    def _decode_names(names: np.ndarray) -> list[str]:
+        """Decode string metadata from numpy arrays into Python strings."""
+        decoded: list[str] = []
+        for name in np.asarray(names).reshape(-1).tolist():
+            if isinstance(name, bytes):
+                decoded.append(name.decode("utf-8"))
+            else:
+                decoded.append(str(name))
+        return decoded
+
+    @staticmethod
+    def _to_index_list(indexes: Sequence[int] | torch.Tensor) -> list[int]:
+        """Convert a sequence or tensor of indices to plain Python ints."""
+        if isinstance(indexes, torch.Tensor):
+            return [int(index) for index in indexes.detach().cpu().reshape(-1).tolist()]
+        return [int(index) for index in indexes]
+
+    @staticmethod
+    def _validate_name_count(names: Sequence[str], expected_count: int, kind: str, path: str) -> None:
+        """Validate that metadata count matches the array axis it describes."""
+        if len(names) != expected_count:
+            raise ValueError(
+                f"Motion clip {path!r} has {expected_count} {kind}s in arrays but {len(names)} {kind}_names entries."
+            )
+
+    @staticmethod
+    def _indexes_by_name(requested: Sequence[str], available: Sequence[str], kind: str, path: str) -> list[int]:
+        """Return indices mapping requested names into available names."""
+        if len(set(available)) != len(available):
+            raise ValueError(f"Motion clip {path!r} has duplicate {kind}_names metadata.")
+
+        index_by_name = {name: i for i, name in enumerate(available)}
+        missing = [name for name in requested if name not in index_by_name]
+        if missing:
+            raise KeyError(
+                f"Motion clip {path!r} is missing requested {kind} names {missing!r}. "
+                f"Available names: {list(available)!r}"
+            )
+        return [index_by_name[name] for name in requested]
+
     # ------------------------------------------------------------------
     # Per-frame property API (mirrors the BeyondMimic single-clip loader).
     # ------------------------------------------------------------------
     @property
     def body_pos_w(self) -> torch.Tensor:
         """Pooled body positions for the selected bodies, ``(T, B, 3)``."""
-        return self._body_pos_w[:, self._body_indexes]
+        return self._body_pos_w
 
     @property
     def body_quat_w(self) -> torch.Tensor:
         """Pooled body orientations for the selected bodies, ``(T, B, 4)``."""
-        return self._body_quat_w[:, self._body_indexes]
+        return self._body_quat_w
 
     @property
     def body_lin_vel_w(self) -> torch.Tensor:
         """Pooled body linear velocities for the selected bodies, ``(T, B, 3)``."""
-        return self._body_lin_vel_w[:, self._body_indexes]
+        return self._body_lin_vel_w
 
     @property
     def body_ang_vel_w(self) -> torch.Tensor:
         """Pooled body angular velocities for the selected bodies, ``(T, B, 3)``."""
-        return self._body_ang_vel_w[:, self._body_indexes]
+        return self._body_ang_vel_w
 
     # ------------------------------------------------------------------
     # Clip-boundary helpers.

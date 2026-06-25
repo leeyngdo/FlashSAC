@@ -62,9 +62,11 @@ class MotionCommand(CommandTerm):
 
         self.motion = MotionLoader(
             self.cfg.resolved_motion_files,
-            self.body_indexes,
+            body_indexes=self.body_indexes,
             device=self.device,
             balance_mode=self.cfg.balance_mode,
+            body_names=self.cfg.body_names,
+            joint_names=self.robot.joint_names,
         )
         self.time_steps = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
         self.body_pos_relative_w = torch.zeros(self.num_envs, len(cfg.body_names), 3, device=self.device)
@@ -204,9 +206,9 @@ class MotionCommand(CommandTerm):
         self.metrics["sampling_top1_bin"][:] = 0.0
 
     def _uniform_frame_sampling(self, env_ids: Sequence[int]) -> None:
-        self.time_steps[env_ids] = self.motion.sample_start_frames(
-            len(env_ids), balance_mode="frame"
-        ).to(device=self.device)
+        self.time_steps[env_ids] = self.motion.sample_start_frames(len(env_ids), balance_mode="frame").to(
+            device=self.device
+        )
         self._set_uniform_sampling_metrics()
 
     def _adaptive_sampling(self, env_ids: Sequence[int]):
