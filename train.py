@@ -21,9 +21,17 @@ from omegaconf import OmegaConf
 
 from flash_rl.agents import create_agent
 from flash_rl.common import create_logger
+from flash_rl.common.distributed import barrier, cleanup, init_process_group, is_main, rank, world_size
 from flash_rl.envs import create_envs
 from flash_rl.evaluation import evaluate, record_video
 from flash_rl.types import Tensor
+
+
+def _scale_interaction_interval(interval: Optional[int], world_size: int) -> Optional[int]:
+    """Keep eval/log/save intervals aligned with global env steps in distributed runs."""
+    if not interval:
+        return interval
+    return max(1, (interval + world_size - 1) // world_size)
 
 
 def run(args: argparse.Namespace) -> None:
@@ -44,15 +52,39 @@ def run(args: argparse.Namespace) -> None:
     OmegaConf.resolve(cfg)
 
     ###############################
+    # distributed (data-parallel) setup
+    ###############################
+
+    # `torchrun` sets RANK/WORLD_SIZE/LOCAL_RANK; defaults to a single process otherwise.
+    dist_rank = rank()
+    dist_world_size = world_size()
+    main_rank = is_main()
+    global_num_interaction_steps = int(cfg.num_interaction_steps)
+    num_interaction_steps = global_num_interaction_steps // dist_world_size
+    evaluation_per_interaction_step = _scale_interaction_interval(cfg.evaluation_per_interaction_step, dist_world_size)
+    metrics_per_interaction_step = _scale_interaction_interval(cfg.metrics_per_interaction_step, dist_world_size)
+    recording_per_interaction_step = _scale_interaction_interval(cfg.recording_per_interaction_step, dist_world_size)
+    logging_per_interaction_step = _scale_interaction_interval(cfg.logging_per_interaction_step, dist_world_size)
+    save_checkpoint_per_interaction_step = _scale_interaction_interval(
+        cfg.save_checkpoint_per_interaction_step, dist_world_size
+    )
+    save_buffer_per_interaction_step = _scale_interaction_interval(
+        cfg.save_buffer_per_interaction_step, dist_world_size
+    )
+
+    ###############################
     # seeding / configuration
     ###############################
 
-    # Set random seed
-    random.seed(cfg.seed)
-    np.random.seed(cfg.seed)
+    # Host-side RNG is offset per rank for exploration diversity, but the torch RNG is kept
+    # identical so every rank initializes identical network weights (also broadcast from
+    # rank 0 inside the agent). The env seed is offset per rank below, before create_envs.
+    random.seed(cfg.seed + dist_rank)
+    np.random.seed(cfg.seed + dist_rank)
     torch.manual_seed(cfg.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(cfg.seed)
+    cfg.env.seed = cfg.seed + dist_rank
 
     if torch.cuda.is_available():
         torch.backends.cudnn.benchmark = True
@@ -64,6 +96,10 @@ def run(args: argparse.Namespace) -> None:
     # envs
     #############################
     train_env, eval_env, record_env = create_envs(**cfg.env)
+
+    # Initialize the process group after the (IsaacLab) simulator has bound CUDA to this
+    # rank's local GPU. No-op when running in a single process.
+    init_process_group()
 
     observation_space = train_env.observation_space
     action_space = train_env.action_space
@@ -88,7 +124,7 @@ def run(args: argparse.Namespace) -> None:
     # train
     #############################
 
-    logger = create_logger(cfg)
+    logger = create_logger(cfg, is_main=main_rank)
 
     # load model if given
     script_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
@@ -101,13 +137,15 @@ def run(args: argparse.Namespace) -> None:
         load_path = os.path.join(script_dir, cfg.buffer_load_path)
         agent.load_replay_buffer(load_path)
 
-    # initial evaluation
-    eval_info = evaluate(agent, eval_env, cfg.num_eval_episodes, cfg.env.env_type)
-    video_info = record_video(agent, record_env, cfg.num_record_episodes, cfg.env.env_type)
-    logger.update_metric(**eval_info)
-    logger.update_metric(**video_info)
-    logger.log_metric(step=0)
-    logger.reset()
+    # initial evaluation (rank 0 only; other ranks wait at the barrier)
+    if main_rank:
+        eval_info = evaluate(agent, eval_env, cfg.num_eval_episodes, cfg.env.env_type)
+        video_info = record_video(agent, record_env, cfg.num_record_episodes, cfg.env.env_type)
+        logger.update_metric(**eval_info)
+        logger.update_metric(**video_info)
+        logger.log_metric(step=0)
+        logger.reset()
+    barrier()
 
     # start training
     observations, env_infos = train_env.reset()
@@ -115,10 +153,19 @@ def run(args: argparse.Namespace) -> None:
     transition: Optional[dict[str, Tensor]] = None
     update_counter = 0
     update_info = {}
+    global_interaction_step = 0
+    env_step = 0
 
-    for interaction_step in tqdm.tqdm(range(1, int(cfg.num_interaction_steps + 1)), smoothing=0.1, mininterval=0.5):
+    for interaction_step in tqdm.tqdm(
+        range(1, num_interaction_steps + 1),
+        smoothing=0.1,
+        mininterval=0.5,
+        disable=not main_rank,
+    ):
         # using env steps simplifies the comparison with the performance reported in the paper.
-        env_step = interaction_step * cfg.num_train_envs
+        # Across data-parallel ranks each interaction step advances num_train_envs * world_size envs.
+        global_interaction_step = interaction_step * dist_world_size
+        env_step = global_interaction_step * cfg.num_train_envs
 
         # collect data. use random actions until agent.can_start_training()
         if agent.can_start_training() and transition is not None:
@@ -158,50 +205,66 @@ def run(args: argparse.Namespace) -> None:
                 logger.update_metric(**update_info)
                 update_counter -= 1
 
-            # evaluation
-            if cfg.evaluation_per_interaction_step and interaction_step % cfg.evaluation_per_interaction_step == 0:
-                eval_info = evaluate(agent, eval_env, cfg.num_eval_episodes, cfg.env.env_type)
-                logger.update_metric(**eval_info)
+            # evaluation (rank 0 only; barrier syncs ranks after rank 0's extra sim work)
+            if evaluation_per_interaction_step and interaction_step % evaluation_per_interaction_step == 0:
+                if main_rank:
+                    eval_info = evaluate(agent, eval_env, cfg.num_eval_episodes, cfg.env.env_type)
+                    logger.update_metric(**eval_info)
+                    if eval_env is train_env:
+                        observations, _ = train_env.reset()
+                        transition = {"next_observation": observations}
+                barrier()
 
-            # metrics
-            if cfg.metrics_per_interaction_step and interaction_step % cfg.metrics_per_interaction_step == 0:
+            # metrics (rank 0 only)
+            if main_rank and metrics_per_interaction_step and interaction_step % metrics_per_interaction_step == 0:
                 metrics_info = agent.get_metrics()
                 logger.update_metric(**metrics_info)
 
-            # video recording
-            if cfg.recording_per_interaction_step and interaction_step % cfg.recording_per_interaction_step == 0:
-                video_info = record_video(agent, record_env, cfg.num_record_episodes, cfg.env.env_type)
-                logger.update_metric(**video_info)
+            # video recording (rank 0 only; barrier syncs ranks after rank 0's extra sim work)
+            if recording_per_interaction_step and interaction_step % recording_per_interaction_step == 0:
+                if main_rank:
+                    video_info = record_video(agent, record_env, cfg.num_record_episodes, cfg.env.env_type)
+                    logger.update_metric(**video_info)
+                    if cfg.num_record_episodes > 0 and record_env is train_env:
+                        observations, _ = train_env.reset()
+                        transition = {"next_observation": observations}
+                barrier()
 
-            # logging
-            if cfg.logging_per_interaction_step and interaction_step % cfg.logging_per_interaction_step == 0:
+            # logging (rank 0 only)
+            if main_rank and logging_per_interaction_step and interaction_step % logging_per_interaction_step == 0:
                 logger.log_metric(step=env_step)
                 logger.reset()
 
-            # checkpointing
-            if (
-                cfg.save_checkpoint_per_interaction_step
-                and interaction_step % cfg.save_checkpoint_per_interaction_step == 0
-            ):
-                save_path = os.path.join(save_path_base, f"step{interaction_step}")
-                agent.save(save_path)
+            # checkpointing (rank 0 only)
+            if save_checkpoint_per_interaction_step and interaction_step % save_checkpoint_per_interaction_step == 0:
+                if main_rank:
+                    save_path = os.path.join(save_path_base, f"step{global_interaction_step}")
+                    agent.save(save_path)
+                barrier()
 
-            # save buffer
-            if cfg.save_buffer_per_interaction_step and interaction_step % cfg.save_buffer_per_interaction_step == 0:
-                save_path = os.path.join(save_path_base, f"step{interaction_step}")
-                agent.save_replay_buffer(save_path)
+            # save buffer (rank 0 only; barrier guards against a long write tripping NCCL)
+            if save_buffer_per_interaction_step and interaction_step % save_buffer_per_interaction_step == 0:
+                if main_rank:
+                    save_path = os.path.join(save_path_base, f"step{global_interaction_step}")
+                    agent.save_replay_buffer(save_path)
+                barrier()
 
-    # final evaluation
-    eval_info = evaluate(agent, eval_env, cfg.num_eval_episodes, cfg.env.env_type)
-    video_info = record_video(agent, record_env, cfg.num_record_episodes, cfg.env.env_type)
-    logger.update_metric(**eval_info)
-    logger.update_metric(**video_info)
-    logger.log_metric(step=env_step)
-    logger.reset()
+    # final evaluation (rank 0 only)
+    if main_rank:
+        eval_info = evaluate(agent, eval_env, cfg.num_eval_episodes, cfg.env.env_type)
+        video_info = record_video(agent, record_env, cfg.num_record_episodes, cfg.env.env_type)
+        logger.update_metric(**eval_info)
+        logger.update_metric(**video_info)
+        logger.log_metric(step=env_step)
+        logger.reset()
+    barrier()
 
     train_env.close()
     eval_env.close()
     record_env.close()
+
+    # tear down the process group cleanly (no-op when single-process)
+    cleanup()
 
 
 if __name__ == "__main__":

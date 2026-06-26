@@ -24,6 +24,7 @@ from flash_rl.agents.utils.network import Network
 from flash_rl.agents.utils.reward_normalization import RewardNormalizer
 from flash_rl.agents.utils.scheduler import warmup_cosine_decay_scheduler
 from flash_rl.buffers.torch_buffer import TorchUniformBuffer
+from flash_rl.common.distributed import broadcast_parameters_, resolve_device_type
 from flash_rl.types import NDArray, Tensor
 
 
@@ -65,7 +66,7 @@ class FlashSACConfig:
 
     temp_initial_value: float
     temp_target_sigma: float
-    temp_target_entropy: float
+    temp_target_entropy: Optional[float]
 
     gamma: float
     n_step: int
@@ -354,7 +355,10 @@ class FlashSACAgent(BaseAgent[FlashSACConfig]):
         else:
             self._actor_observation_dim = self._critic_observation_dim
 
-        temp_target_entropy = 0.5 * self._action_dim * math.log(2 * math.pi * math.e * cfg.temp_target_sigma**2)
+        if cfg.temp_target_entropy is None:
+            temp_target_entropy = 0.5 * self._action_dim * math.log(2 * math.pi * math.e * cfg.temp_target_sigma**2)
+        else:
+            temp_target_entropy = cfg.temp_target_entropy
         compile_mode = _resolve_compile_mode(cfg.compile_mode)
         cfg = replace(cfg, temp_target_entropy=temp_target_entropy, compile_mode=compile_mode)
 
@@ -365,14 +369,7 @@ class FlashSACAgent(BaseAgent[FlashSACConfig]):
             cfg,
         )
         self._cfg = cfg
-
-        device_type = cfg.device_type
-        device_type = (
-            device_type
-            if device_type.startswith("cuda") and ":" in device_type
-            else ("cuda:0" if device_type.startswith("cuda") else "cpu")
-        )
-        self._device = torch.device(device_type)
+        self._device = torch.device(resolve_device_type(cfg.device_type))
 
         # Initialize networks
         (
@@ -386,6 +383,17 @@ class FlashSACAgent(BaseAgent[FlashSACConfig]):
             action_dim=self._action_dim,
             cfg=self._cfg,
             device=self._device,
+        )
+        # Sync initial weights from rank 0 so every data-parallel rank starts identical.
+        # No-op when training in a single process.
+        broadcast_parameters_(
+            [
+                self._actor.network,
+                self._critic.network,
+                self._target_critic.network,
+                self._temperature.network,
+            ],
+            src=0,
         )
         self._update_step = 0
 
@@ -421,7 +429,7 @@ class FlashSACAgent(BaseAgent[FlashSACConfig]):
             max_length=self._cfg.buffer_max_length,
             min_length=self._cfg.buffer_min_length,
             sample_batch_size=self._cfg.sample_batch_size,
-            device_type=self._cfg.buffer_device_type,
+            device_type=resolve_device_type(self._cfg.buffer_device_type),
             obs_storage_dtype=_obs_dtype,
         )
 

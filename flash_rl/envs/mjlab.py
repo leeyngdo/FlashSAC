@@ -11,6 +11,15 @@ from gymnasium.vector.utils import batch_space
 from ..types import F32NDArray, NDArray
 
 
+def _select_actor_obs_key(obs_groups: list[str]) -> str:
+    for key in ("actor", "policy"):
+        if key in obs_groups:
+            return key
+    if not obs_groups:
+        raise ValueError("mjlab environment exposes no observation groups.")
+    return obs_groups[0]
+
+
 class MjlabVectorEnv(VectorEnv[F32NDArray, F32NDArray, F32NDArray]):
     """Gymnasium VectorEnv wrapping mjlab's ManagerBasedRlEnv for FlashSAC.
 
@@ -52,19 +61,19 @@ class MjlabVectorEnv(VectorEnv[F32NDArray, F32NDArray, F32NDArray]):
         self.num_envs = num_envs
 
         # Determine obs layout
-        obs_groups = list(self._env.single_observation_space.spaces.keys())
-        self._has_critic_obs = "actor" in obs_groups and "critic" in obs_groups
-        self._actor_obs_dim = int(self._env.single_observation_space.spaces["actor"].shape[0])
-        if self._has_critic_obs:
-            flat_dim = int(self._env.single_observation_space.spaces["critic"].shape[0])
-        else:
-            flat_dim = self._actor_obs_dim
+        obs_space = self._env.single_observation_space
+        obs_groups = list(obs_space.spaces.keys())
+        self._actor_obs_key = _select_actor_obs_key(obs_groups)
+        self._critic_obs_key = "critic" if "critic" in obs_groups else None
+        self._has_critic_obs = self._critic_obs_key is not None and self._critic_obs_key != self._actor_obs_key
+        self._actor_obs_dim = int(obs_space.spaces[self._actor_obs_key].shape[0])
+        flat_dim = int(obs_space.spaces[self._critic_obs_key].shape[0]) if self._has_critic_obs else self._actor_obs_dim
 
         action_dim = int(self._env.single_action_space.shape[0])
 
         self.single_observation_space = gym.spaces.Box(low=-np.inf, high=np.inf, shape=(flat_dim,), dtype=np.float32)
         self.observation_space = batch_space(self.single_observation_space, num_envs)
-        self.single_action_space = gym.spaces.Box(low=-np.inf, high=np.inf, shape=(action_dim,), dtype=np.float32)
+        self.single_action_space = gym.spaces.Box(low=-1.0, high=1.0, shape=(action_dim,), dtype=np.float32)
         self.action_space = batch_space(self.single_action_space, num_envs)
 
         # Expose for FlashSAC agent/env setup (mirrors IsaacLabVectorEnv)
@@ -77,16 +86,19 @@ class MjlabVectorEnv(VectorEnv[F32NDArray, F32NDArray, F32NDArray]):
         self._obs_prefix_checked = False
 
     def _flatten_obs(self, obs_dict: dict[str, Any]) -> F32NDArray:
-        flat = obs_dict["critic"] if self._has_critic_obs else obs_dict["actor"]
+        obs_key = self._critic_obs_key if self._has_critic_obs else self._actor_obs_key
+        assert obs_key is not None
+        flat = obs_dict[obs_key]
         return flat.cpu().numpy().astype(np.float32)
 
     def _check_obs_prefix(self, obs_dict: dict[str, Any]) -> None:
         """Assert critic_obs[:actor_dim] == actor_obs (critic must be a superset)."""
-        actor = obs_dict["actor"].float()
-        critic = obs_dict["critic"].float()
-        err = ((actor - critic[:, : self._actor_obs_dim]) ** 2).sum().item()
-        assert err < 1e-6, (
-            f"critic_obs[:actor_dim] != actor_obs (err={err:.2e}). "
+        assert self._critic_obs_key is not None
+        actor = obs_dict[self._actor_obs_key].float()
+        critic = obs_dict[self._critic_obs_key].float()
+        err = (actor - critic[:, : self._actor_obs_dim]).abs().max().item()
+        assert err < 1e-5, (
+            f"critic_obs[:actor_dim] != actor_obs (max_err={err:.2e}). "
             "Critic obs must contain actor obs as a prefix for single-buffer storage."
         )
 
@@ -185,13 +197,19 @@ class MjlabVectorEnv(VectorEnv[F32NDArray, F32NDArray, F32NDArray]):
         instance._to_numpy = to_numpy
         instance.num_envs = env.num_envs
 
-        obs_groups = list(env.single_observation_space.spaces.keys())
-        instance._has_critic_obs = "actor" in obs_groups and "critic" in obs_groups
-        instance._actor_obs_dim = int(env.single_observation_space.spaces["actor"].shape[0])
-        if instance._has_critic_obs:
-            flat_dim = int(env.single_observation_space.spaces["critic"].shape[0])
-        else:
-            flat_dim = instance._actor_obs_dim
+        obs_space = env.single_observation_space
+        obs_groups = list(obs_space.spaces.keys())
+        instance._actor_obs_key = _select_actor_obs_key(obs_groups)
+        instance._critic_obs_key = "critic" if "critic" in obs_groups else None
+        instance._has_critic_obs = (
+            instance._critic_obs_key is not None and instance._critic_obs_key != instance._actor_obs_key
+        )
+        instance._actor_obs_dim = int(obs_space.spaces[instance._actor_obs_key].shape[0])
+        flat_dim = (
+            int(obs_space.spaces[instance._critic_obs_key].shape[0])
+            if instance._has_critic_obs
+            else instance._actor_obs_dim
+        )
 
         action_dim = int(env.single_action_space.shape[0])
 
@@ -199,7 +217,7 @@ class MjlabVectorEnv(VectorEnv[F32NDArray, F32NDArray, F32NDArray]):
             low=-np.inf, high=np.inf, shape=(flat_dim,), dtype=np.float32
         )
         instance.observation_space = batch_space(instance.single_observation_space, env.num_envs)
-        instance.single_action_space = gym.spaces.Box(low=-np.inf, high=np.inf, shape=(action_dim,), dtype=np.float32)
+        instance.single_action_space = gym.spaces.Box(low=-1.0, high=1.0, shape=(action_dim,), dtype=np.float32)
         instance.action_space = batch_space(instance.single_action_space, env.num_envs)
 
         instance.obs_size = (flat_dim,)

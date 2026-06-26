@@ -18,6 +18,15 @@ from omegaconf import OmegaConf
 from flash_rl.agents import create_agent
 
 
+def _select_actor_obs_key(obs_groups: list[str]) -> str:
+    for key in ("actor", "policy"):
+        if key in obs_groups:
+            return key
+    if not obs_groups:
+        raise ValueError("mjlab environment exposes no observation groups.")
+    return obs_groups[0]
+
+
 class _MjlabViewerEnv:
     """Thin wrapper that adds get_observations() to ManagerBasedRlEnv (or VideoRecorder).
 
@@ -63,22 +72,20 @@ class _MjlabViewerEnv:
 class _FlashSACPolicy:
     """Bridges FlashSAC's sample_actions to mjlab's PolicyProtocol.
 
-    Receives the obs dict from env.get_observations() and mirrors exactly
-    what MjlabVectorEnv._flatten_obs does: concatenates actor+critic when
-    both groups are present, otherwise uses the single group as-is.
+    Receives the obs dict from env.get_observations() and mirrors exactly what
+    MjlabVectorEnv._flatten_obs does: if critic observations are available, use
+    critic obs directly and rely on critic_obs[:actor_dim] being actor obs.
     sample_actions then handles the asymmetric_observation flag internally
     (slicing to actor-only dim if True, using the full flat obs if False).
     """
 
-    def __init__(self, agent: Any, device: str, actor_key: str, has_asymmetric: bool) -> None:
+    def __init__(self, agent: Any, device: str, obs_key: str) -> None:
         self._agent = agent
         self._device = device
-        self._actor_key = actor_key
-        self._has_asymmetric = has_asymmetric
+        self._obs_key = obs_key
 
     def __call__(self, obs_dict: dict[str, torch.Tensor]) -> torch.Tensor:
-        actor_obs = obs_dict[self._actor_key]
-        flat = torch.cat([actor_obs, obs_dict["critic"]], dim=-1) if self._has_asymmetric else actor_obs
+        flat = obs_dict[self._obs_key]
         flat_obs_np = flat.cpu().numpy()
         actions_np = self._agent.sample_actions(
             interaction_step=0,
@@ -135,19 +142,23 @@ def play(args: argparse.Namespace) -> None:
 
     # Mirror the obs layout logic from MjlabVectorEnv so the agent matches training.
     obs_groups = list(raw_env.single_observation_space.spaces.keys())
-    has_asymmetric = "actor" in obs_groups and "critic" in obs_groups
-    actor_key = "actor" if "actor" in obs_groups else obs_groups[0]
+    actor_key = _select_actor_obs_key(obs_groups)
+    critic_key = "critic" if "critic" in obs_groups else None
+    has_asymmetric = critic_key is not None and critic_key != actor_key
     actor_dim = int(raw_env.single_observation_space.spaces[actor_key].shape[0])
     if has_asymmetric:
-        critic_dim = int(raw_env.single_observation_space.spaces["critic"].shape[0])
-        flat_dim = actor_dim + critic_dim
+        assert critic_key is not None
+        critic_dim = int(raw_env.single_observation_space.spaces[critic_key].shape[0])
+        flat_dim = critic_dim
+        obs_key = critic_key
     else:
         flat_dim = actor_dim
+        obs_key = actor_key
     action_dim = int(raw_env.single_action_space.shape[0])
 
     single_obs_space = gym.spaces.Box(low=-np.inf, high=np.inf, shape=(flat_dim,), dtype=np.float32)
     obs_space = batch_space(single_obs_space, args.num_envs)
-    single_act_space = gym.spaces.Box(low=-np.inf, high=np.inf, shape=(action_dim,), dtype=np.float32)
+    single_act_space = gym.spaces.Box(low=-1.0, high=1.0, shape=(action_dim,), dtype=np.float32)
     act_space = batch_space(single_act_space, args.num_envs)
 
     env_info: dict[str, Any] = {}
@@ -162,7 +173,7 @@ def play(args: argparse.Namespace) -> None:
     )
     agent.load(args.checkpoint_path)
 
-    policy = _FlashSACPolicy(agent, device=device, actor_key=actor_key, has_asymmetric=has_asymmetric)
+    policy = _FlashSACPolicy(agent, device=device, obs_key=obs_key)
 
     # Pre-step once so sensor caches (e.g. raycast _cached_frame_pos) are populated
     # before the viewer calls sync_env_to_viewer on its first tick.
@@ -213,7 +224,10 @@ if __name__ == "__main__":
         type=str,
         default="auto",
         choices=["auto", "native", "viser", "none"],
-        help="Viewer backend: native (MuJoCo GUI), viser (browser), auto (detect from $DISPLAY), none (headless; use with --video)",
+        help=(
+            "Viewer backend: native (MuJoCo GUI), viser (browser), auto "
+            "(detect from $DISPLAY), none (headless; use with --video)"
+        ),
     )
     parser.add_argument(
         "--num_steps",
