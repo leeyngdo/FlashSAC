@@ -1,3 +1,6 @@
+from collections.abc import Callable
+from functools import partial
+from importlib import import_module
 from typing import Any, Union, cast
 
 import gymnasium as gym
@@ -7,6 +10,8 @@ from gymnasium.vector import VectorEnv
 from gymnasium.vector.utils import batch_space
 
 from ..types import F32NDArray, NDArray
+from .isaaclab_envs.tracking.overrides import apply_tracking_overrides, omegaconf_to_plain
+from .isaaclab_envs.utils.action_bounds import compute_joint_limit_action_bound
 
 # NOTE: There is no way to get the action bounds from the env, so we hardcode them here following FastTD3
 ACTION_BOUNDS = {
@@ -22,6 +27,14 @@ ACTION_BOUNDS = {
     "Isaac-Velocity-Rough-Anymal-C-v0": 1.0,
     "Isaac-Velocity-Flat-Anymal-D-v0": 1.0,
     "Isaac-Velocity-Rough-Anymal-D-v0": 1.0,
+    "Isaac-Tracking-Flat-G1-v0": 1.0,
+    "Isaac-Tracking-Flat-G1-WoSE-v0": 1.0,
+}
+
+# NOTE: Local IsaacLab tasks must be imported after AppLauncher starts IsaacSim and before parse_env_cfg.
+LOCAL_ISAACLAB_TASKS: dict[str, tuple[str, Callable[..., Any] | None]] = {
+    "Isaac-Tracking-Flat-G1-v0": ("flash_rl.envs.isaaclab_envs.tracking.config.g1", apply_tracking_overrides),
+    "Isaac-Tracking-Flat-G1-WoSE-v0": ("flash_rl.envs.isaaclab_envs.tracking.config.g1", apply_tracking_overrides),
 }
 
 
@@ -64,6 +77,14 @@ class IsaacLabVectorEnv(
         action_bounds: float,
         to_numpy: bool = True,
         headless: bool = True,
+        enable_cameras: bool = False,
+        reward: dict[str, Any] | None = None,
+        observation: dict[str, Any] | None = None,
+        termination: dict[str, Any] | None = None,
+        robot: dict[str, Any] | None = None,
+        motion: dict[str, Any] | None = None,
+        cfg_overrides: dict[str, Any] | None = None,
+        action_bound: dict[str, Any] | None = None,
         distributed: bool = False,
     ):
         from isaaclab.app import AppLauncher
@@ -72,9 +93,14 @@ class IsaacLabVectorEnv(
             headless=headless,
             device=device,
             distributed=distributed,
-            enable_cameras=not headless,
+            enable_cameras=enable_cameras or not headless,
         )
         self.simulation_app = app_launcher.app
+
+        local_task = LOCAL_ISAACLAB_TASKS.get(env_name)
+        if local_task is not None:
+            module_name, _ = local_task
+            import_module(module_name)
 
         from isaaclab_tasks.utils.parse_cfg import parse_env_cfg
 
@@ -86,7 +112,30 @@ class IsaacLabVectorEnv(
         env_cfg.seed = seed
         self.seed = seed
         self.device = device
+
+        if local_task is not None:
+            _, apply_local_overrides = local_task
+            if apply_local_overrides is not None:
+                apply_local_overrides(
+                    env_cfg,
+                    reward=omegaconf_to_plain(reward),
+                    observation=omegaconf_to_plain(observation),
+                    termination=omegaconf_to_plain(termination),
+                    robot=omegaconf_to_plain(robot),
+                    motion=omegaconf_to_plain(motion),
+                    cfg_overrides=omegaconf_to_plain(cfg_overrides),
+                )
+
         self.envs = gym.make(env_name, cfg=env_cfg, render_mode=None)
+        setattr(cast(Any, self.envs.unwrapped), "eval_mode", False)
+
+        self._final_obs_buf: dict[str, torch.Tensor] | None = None
+        _base_env = cast(Any, self.envs.unwrapped)
+        if hasattr(_base_env, "_reset_idx") and hasattr(_base_env, "observation_manager"):
+            # IsaacLab resets done envs inside step() and recomputes observations afterwards, so the
+            # returned obs for a done env is already the post-reset frame. _reset_idx is the last point
+            # where the sim still holds the terminal state; cache it for infos["final_obs"].
+            _base_env._reset_idx = partial(self._reset_idx_with_final_obs, _base_env, _base_env._reset_idx)
 
         self.num_envs = cast(Any, self.envs.unwrapped).num_envs
         self.max_episode_steps = cast(Any, self.envs.unwrapped).max_episode_length
@@ -94,15 +143,16 @@ class IsaacLabVectorEnv(
 
         # Get observation/action spaces
         # NOTE: Action range: [-1, 1] * action_bounds (https://github.com/google-deepmind/mujoco_playground/issues/19)
-        self.obs_size = cast(Any, self.envs.unwrapped).single_observation_space["policy"].shape
-        self.asymmetric_obs = "critic" in cast(Any, self.envs.unwrapped).single_observation_space
+        obs_space = cast(Any, self.envs.unwrapped).single_observation_space
+        self.obs_size = obs_space["policy"].shape
+        self.asymmetric_obs = isinstance(obs_space, gym.spaces.Dict) and "critic" in obs_space.spaces
         if self.asymmetric_obs:
             # NOTE: Env will treat concatenate actor & critic states as the observation,
             # but will give 'actual' observation size in the info.
-            self.critic_obs_size = cast(Any, self.envs.unwrapped).single_observation_space["critic"].shape
+            self.critic_obs_size = obs_space["critic"].shape
             # NOTE: setting to [0, 0] since we only need the shape and dtype
             self.single_observation_space = gym.spaces.Box(
-                low=0.0, high=0.0, shape=self.obs_size + self.critic_obs_size, dtype=np.float32
+                low=0.0, high=0.0, shape=(self.obs_size[-1] + self.critic_obs_size[-1],), dtype=np.float32
             )
             self.observation_space = batch_space(self.single_observation_space, self.num_envs)
         else:
@@ -110,12 +160,72 @@ class IsaacLabVectorEnv(
             self.single_observation_space = gym.spaces.Box(low=0.0, high=0.0, shape=self.obs_size, dtype=np.float32)
             self.observation_space = batch_space(self.single_observation_space, self.num_envs)
 
-        self.action_bounds = action_bounds
         self.action_size = cast(Any, self.envs.unwrapped).single_action_space.shape
-        self.single_action_space = gym.spaces.Box(
-            low=-1.0 * self.action_bounds, high=1.0 * self.action_bounds, shape=self.action_size, dtype=np.float32
-        )
+        self._action_low = torch.full(self.action_size, -float(action_bounds), device=self.device)
+        self._action_high = torch.full(self.action_size, float(action_bounds), device=self.device)
+        action_bound = omegaconf_to_plain(action_bound)
+        if isinstance(action_bound, dict) and action_bound.get("type") == "joint_limit":
+            action_bias, action_range = self._build_joint_limit_bound(
+                fraction=float(action_bound.get("fraction", 1.0)),
+            )
+            self._action_low = action_bias - action_range
+            self._action_high = action_bias + action_range
+            self.single_action_space = gym.spaces.Box(
+                low=self._action_low.cpu().numpy(),
+                high=self._action_high.cpu().numpy(),
+                dtype=np.float32,
+            )
+        else:
+            self.single_action_space = gym.spaces.Box(
+                low=-1.0 * float(action_bounds), high=float(action_bounds), shape=self.action_size, dtype=np.float32
+            )
         self.action_space = batch_space(self.single_action_space, self.num_envs)
+
+    def set_eval_mode(self, eval_mode: bool) -> None:
+        setattr(cast(Any, self.envs.unwrapped), "eval_mode", eval_mode)
+
+    def _reset_idx_with_final_obs(
+        self,
+        base_env: Any,
+        orig_reset_idx: Callable[..., Any],
+        env_ids: Any,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        if env_ids is None:
+            env_ids = slice(None)
+        terminal = base_env.observation_manager.compute()
+        if self._final_obs_buf is None:
+            self._final_obs_buf = {k: torch.zeros_like(v) for k, v in terminal.items()}
+        for k, v in terminal.items():
+            self._final_obs_buf[k][env_ids] = v[env_ids]
+        return orig_reset_idx(env_ids, *args, **kwargs)
+
+    def _build_joint_limit_bound(self, fraction: float) -> tuple[torch.Tensor, torch.Tensor]:
+        """Build the per-joint (bias, range) affine from the live robot joint limits + action scale.
+
+        Reads the soft joint position limits and default joint positions from the robot, and the
+        per-joint scale from the JointPositionAction term (aligned to the action's joint order), then
+        delegates to :func:`compute_joint_limit_action_bound`.
+        """
+        env = cast(Any, self.envs.unwrapped)
+        robot = env.scene["robot"]
+        term = env.action_manager.get_term("joint_pos")
+        soft = robot.data.soft_joint_pos_limits[0]  # [J_robot, 2]
+        default = robot.data.default_joint_pos[0]  # [J_robot]
+        joint_ids = getattr(term, "_joint_ids", slice(None))
+        if not isinstance(joint_ids, slice):
+            idx = torch.as_tensor(joint_ids, device=soft.device, dtype=torch.long)
+            soft = soft[idx]
+            default = default[idx]
+        scale = torch.as_tensor(term._scale, device=soft.device, dtype=torch.float32)
+        if scale.ndim > 1:
+            scale = scale[0]
+        scale = scale.reshape(-1)
+        if scale.numel() == 1:
+            scale = scale.expand(soft.shape[0])
+        bias, rng = compute_joint_limit_action_bound(soft, default, scale, fraction=fraction)
+        return bias.to(self.device).float(), rng.to(self.device).float()
 
     def reset(
         self,
@@ -161,9 +271,8 @@ class IsaacLabVectorEnv(
         else:
             torch_actions = torch.from_numpy(actions).to(self.device)
 
-        if self.action_bounds is not None:
-            torch_actions = torch.clamp(torch_actions, -1.0, 1.0) * self.action_bounds
-        obs_dict, rew, terminations, truncations, infos = cast(Any, self.envs.step(torch_actions))
+        torch_actions = torch.clamp(torch_actions, self._action_low, self._action_high)
+        obs_dict, rew, terminations, truncations, raw_infos = cast(Any, self.envs.step(torch_actions))
         obs = obs_dict["policy"]
         if self.asymmetric_obs:
             critic_obs = obs_dict["critic"]
@@ -174,7 +283,21 @@ class IsaacLabVectorEnv(
         # NOTE: There's really no way to get the raw observations from IsaacLab
         # We just use the 'reset_obs' as next_obs, unfortunately.
         # See https://github.com/isaac-sim/IsaacLab/issues/1362
-        infos["final_obs"] = obs
+        if self._final_obs_buf is not None:
+            final_obs = self._final_obs_buf["policy"]
+            if self.asymmetric_obs:
+                final_obs = torch.cat((final_obs, self._final_obs_buf["critic"]), dim=-1)
+            infos["final_obs"] = final_obs
+        else:
+            infos["final_obs"] = obs
+
+        log = raw_infos.get("log") if isinstance(raw_infos, dict) else None
+        if log and (bool(terminations.any()) or bool(truncations.any())):
+            episode_info: dict[str, float] = {}
+            for key, value in log.items():
+                episode_info[key] = float(value.item()) if hasattr(value, "item") else float(value)
+            if episode_info:
+                infos["episode_info"] = episode_info
 
         if self.to_numpy:
             obs = obs.cpu().numpy()
@@ -198,6 +321,14 @@ def make_isaaclab_env(
     num_envs: int,
     seed: int,
     headless: bool = True,
+    enable_cameras: bool = False,
+    reward: dict[str, Any] | None = None,
+    observation: dict[str, Any] | None = None,
+    termination: dict[str, Any] | None = None,
+    robot: dict[str, Any] | None = None,
+    motion: dict[str, Any] | None = None,
+    cfg_overrides: dict[str, Any] | None = None,
+    action_bound: dict[str, Any] | None = None,
 ) -> IsaacLabVectorEnv:
     if env_name not in ACTION_BOUNDS:
         print(f"Action bounds not defined for {env_name}; using default value 1.0.")
@@ -215,6 +346,14 @@ def make_isaaclab_env(
         action_bounds=action_bounds,
         to_numpy=True,
         headless=headless,
+        enable_cameras=enable_cameras,
+        reward=reward,
+        observation=observation,
+        termination=termination,
+        robot=robot,
+        motion=motion,
+        cfg_overrides=cfg_overrides,
+        action_bound=action_bound,
         distributed=distributed,
     )
     return env

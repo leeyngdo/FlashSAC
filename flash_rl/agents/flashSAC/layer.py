@@ -24,6 +24,15 @@ class UnitLinear(nn.Module):
         self.w.weight.copy_(F.normalize(self.w.weight, dim=-1, eps=1e-8))
 
 
+class PolicyHeadLinear(nn.Module):
+    def __init__(self, input_dim: int, output_dim: int):
+        super().__init__()
+        self.w = nn.Linear(input_dim, output_dim, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.w(x)  # type: ignore[no-any-return]
+
+
 class UnitBatchNorm(nn.Module):
     running_mean: torch.Tensor
     running_var: torch.Tensor
@@ -113,18 +122,26 @@ class NormalTanhPolicy(nn.Module):
         self,
         hidden_dim: int,
         action_dim: int,
-        log_std_min: float = -10.0,
-        log_std_max: float = 2.0,
+        action_bias: torch.Tensor,
+        action_range: torch.Tensor,
+        log_std_min: float = -5.0,
+        log_std_max: float = 0.0,
     ):
         super().__init__()
-        self.mean_w = UnitLinear(hidden_dim, action_dim)
+        self.mean_w = PolicyHeadLinear(hidden_dim, action_dim)
         self.mean_bias = nn.Parameter(torch.zeros(action_dim))
 
-        self.std_w = UnitLinear(hidden_dim, action_dim)
+        self.std_w = PolicyHeadLinear(hidden_dim, action_dim)
         self.std_bias = nn.Parameter(torch.zeros(action_dim))
+        nn.init.normal_(self.mean_w.w.weight, mean=0.0, std=1e-3)
+        nn.init.zeros_(self.std_w.w.weight)
 
         self.log_std_min = log_std_min
         self.log_std_max = log_std_max
+        safe_action_range = torch.clamp(action_range.abs(), min=1e-6)
+        self.register_buffer("action_bias", action_bias.float(), persistent=False)
+        self.register_buffer("action_range", action_range.float(), persistent=False)
+        self.register_buffer("log_action_range", torch.log(safe_action_range).sum(), persistent=False)
 
     def get_mean_and_std(
         self,
@@ -151,14 +168,16 @@ class NormalTanhPolicy(nn.Module):
         dist = torch.distributions.Normal(mean, std)
         raw_action = dist.rsample()
         tanh_action = torch.tanh(raw_action)
+        action = self.action_bias + self.action_range * tanh_action
 
         # Compute log probability (accounting for tanh via Jacobian correction)
         log_prob = dist.log_prob(raw_action)  # type: ignore[no-untyped-call]
         log_prob = log_prob - safe_tanh_log_det_jacobian(raw_action)
         log_prob = log_prob.sum(1)
+        log_prob = log_prob - self.log_action_range
 
         info: dict[str, torch.Tensor] = {"log_prob": log_prob}
-        return tanh_action, info
+        return action, info
 
 
 # -------------------------------------

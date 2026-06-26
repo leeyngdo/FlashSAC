@@ -181,15 +181,9 @@ ignore_missing_imports = true
 module = "flash_rl.envs.genesis_envs.*"
 ignore_errors = true
 
-[tool.setuptools]
-packages = [
-    "flash_rl",
-    "flash_rl.agents",
-    "flash_rl.agents.flashSAC",
-    "flash_rl.agents.utils",
-    "flash_rl.buffers",
-    "flash_rl.common",
-    "flash_rl.envs",
-    "flash_rl.envs.genesis_envs",
-    "flash_rl.envs.wrappers",
-]
+[[tool.mypy.overrides]]
+module = "flash_rl.envs.isaaclab_envs.*"
+ignore_errors = true
+
+[tool.setuptools.packages.find]
+include = ["flash_rl*"]

@@ -4,6 +4,7 @@ from dataclasses import dataclass, replace
 from typing import Any, MutableMapping, Optional, cast
 
 import gymnasium as gym
+import numpy as np
 import torch
 import torch.optim as optim
 from torch.amp.grad_scaler import GradScaler
@@ -66,7 +67,7 @@ class FlashSACConfig:
 
     temp_initial_value: float
     temp_target_sigma: float
-    temp_target_entropy: float
+    temp_target_entropy: float | None
 
     gamma: float
     n_step: int
@@ -85,6 +86,8 @@ def _init_flashsac_networks(
     actor_observation_dim: int,
     critic_observation_dim: int,
     action_dim: int,
+    action_bias: torch.Tensor,
+    action_range: torch.Tensor,
     cfg: FlashSACConfig,
     device: torch.device,
 ) -> tuple[Network, Network, Network, Network]:
@@ -103,6 +106,8 @@ def _init_flashsac_networks(
         input_dim=actor_observation_dim,
         hidden_dim=cfg.actor_hidden_dim,
         action_dim=action_dim,
+        action_bias=action_bias,
+        action_range=action_range,
     ).to(device)
 
     use_fused = device.type == "cuda" and torch.cuda.is_available()
@@ -228,6 +233,8 @@ def _sample_flashsac_actions(
     noise: torch.Tensor,
     observations: torch.Tensor,
     temperature: float,
+    action_bias: torch.Tensor,
+    action_range: torch.Tensor,
     cur_count: torch.Tensor,
     cur_n: torch.Tensor,
     zeta_cdf: torch.Tensor,
@@ -241,7 +248,7 @@ def _sample_flashsac_actions(
     )
     # return deterministic actions without changing noise sampling params
     if temperature == 0.0:
-        actions = torch.tanh(mean)
+        actions = action_bias + action_range * torch.tanh(mean)
         return noise, actions, cur_count, cur_n
 
     # reinit noise after a certain number of steps (only during training)
@@ -255,7 +262,7 @@ def _sample_flashsac_actions(
     cur_count = torch.where(reinit, torch.zeros_like(cur_count), cur_count)
 
     # sample action
-    actions = torch.tanh(mean + std * noise * temperature)
+    actions = action_bias + action_range * torch.tanh(mean + std * noise * temperature)
 
     return noise, actions, cur_count + 1, cur_n
 
@@ -355,7 +362,27 @@ class FlashSACAgent(BaseAgent[FlashSACConfig]):
         else:
             self._actor_observation_dim = self._critic_observation_dim
 
-        temp_target_entropy = 0.5 * self._action_dim * math.log(2 * math.pi * math.e * cfg.temp_target_sigma**2)
+        self._device = torch.device(resolve_device_type(cfg.device_type))
+
+        if not isinstance(action_space, gym.spaces.Box):
+            raise TypeError(f"FlashSAC expects a Box action space, got {type(action_space).__name__}.")
+        action_low = torch.as_tensor(np.asarray(action_space.low), dtype=torch.float32, device=self._device)
+        action_high = torch.as_tensor(np.asarray(action_space.high), dtype=torch.float32, device=self._device)
+        action_low = action_low.reshape(-1, self._action_dim)[0]
+        action_high = action_high.reshape(-1, self._action_dim)[0]
+        if not torch.isfinite(action_low).all() or not torch.isfinite(action_high).all():
+            raise ValueError("FlashSAC requires finite action bounds for tanh-squashed policies.")
+        self._action_range = 0.5 * (action_high - action_low)
+        if (self._action_range < 0).any():
+            raise ValueError("FlashSAC received an action space with high < low.")
+        self._action_bias = 0.5 * (action_high + action_low)
+
+        if cfg.temp_target_entropy is None:
+            base_target_entropy = 0.5 * self._action_dim * math.log(2 * math.pi * math.e * cfg.temp_target_sigma**2)
+            log_action_range = torch.log(torch.clamp(self._action_range.abs(), min=1e-6)).sum().item()
+            temp_target_entropy = base_target_entropy + log_action_range
+        else:
+            temp_target_entropy = cfg.temp_target_entropy
         compile_mode = _resolve_compile_mode(cfg.compile_mode)
         cfg = replace(cfg, temp_target_entropy=temp_target_entropy, compile_mode=compile_mode)
 
@@ -366,7 +393,6 @@ class FlashSACAgent(BaseAgent[FlashSACConfig]):
             cfg,
         )
         self._cfg = cfg
-        self._device = torch.device(resolve_device_type(cfg.device_type))
 
         # Initialize networks
         (
@@ -378,6 +404,8 @@ class FlashSACAgent(BaseAgent[FlashSACConfig]):
             actor_observation_dim=self._actor_observation_dim,
             critic_observation_dim=self._critic_observation_dim,
             action_dim=self._action_dim,
+            action_bias=self._action_bias,
+            action_range=self._action_range,
             cfg=self._cfg,
             device=self._device,
         )
@@ -458,6 +486,8 @@ class FlashSACAgent(BaseAgent[FlashSACConfig]):
                 noise=self._cached_noise,
                 observations=observations,
                 temperature=temperature,
+                action_bias=self._action_bias,
+                action_range=self._action_range,
                 cur_count=self._cur_noise_repeat_count,
                 cur_n=self._cur_noise_repeat_n,
                 zeta_cdf=self._zeta_cdf,
