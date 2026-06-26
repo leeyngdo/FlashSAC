@@ -11,15 +11,6 @@ from gymnasium.vector.utils import batch_space
 from ..types import F32NDArray, NDArray
 
 
-def _select_actor_obs_key(obs_groups: list[str]) -> str:
-    for key in ("actor", "policy"):
-        if key in obs_groups:
-            return key
-    if not obs_groups:
-        raise ValueError("mjlab environment exposes no observation groups.")
-    return obs_groups[0]
-
-
 class MjlabVectorEnv(VectorEnv[F32NDArray, F32NDArray, F32NDArray]):
     """Gymnasium VectorEnv wrapping mjlab's ManagerBasedRlEnv for FlashSAC.
 
@@ -33,7 +24,7 @@ class MjlabVectorEnv(VectorEnv[F32NDArray, F32NDArray, F32NDArray]):
       superset of actor obs). env_info["actor_observation_size"] is always set so
       FlashSAC's agent slices obs[:actor_dim] for the actor and obs for the critic.
       This halves buffer memory vs the previous [actor | critic] concatenation.
-    - Otherwise: the single group is used as-is.
+    - Otherwise: the actor group is used as-is.
 
     Actions are passed through unchanged (mjlab action terms handle scaling internally).
     """
@@ -63,9 +54,11 @@ class MjlabVectorEnv(VectorEnv[F32NDArray, F32NDArray, F32NDArray]):
         # Determine obs layout
         obs_space = self._env.single_observation_space
         obs_groups = list(obs_space.spaces.keys())
-        self._actor_obs_key = _select_actor_obs_key(obs_groups)
+        if "actor" not in obs_groups:
+            raise ValueError(f"mjlab env must expose an 'actor' observation group, got {obs_groups}.")
+        self._actor_obs_key = "actor"
         self._critic_obs_key = "critic" if "critic" in obs_groups else None
-        self._has_critic_obs = self._critic_obs_key is not None and self._critic_obs_key != self._actor_obs_key
+        self._has_critic_obs = self._critic_obs_key is not None
         self._actor_obs_dim = int(obs_space.spaces[self._actor_obs_key].shape[0])
         flat_dim = int(obs_space.spaces[self._critic_obs_key].shape[0]) if self._has_critic_obs else self._actor_obs_dim
 
@@ -199,11 +192,11 @@ class MjlabVectorEnv(VectorEnv[F32NDArray, F32NDArray, F32NDArray]):
 
         obs_space = env.single_observation_space
         obs_groups = list(obs_space.spaces.keys())
-        instance._actor_obs_key = _select_actor_obs_key(obs_groups)
+        if "actor" not in obs_groups:
+            raise ValueError(f"mjlab env must expose an 'actor' observation group, got {obs_groups}.")
+        instance._actor_obs_key = "actor"
         instance._critic_obs_key = "critic" if "critic" in obs_groups else None
-        instance._has_critic_obs = (
-            instance._critic_obs_key is not None and instance._critic_obs_key != instance._actor_obs_key
-        )
+        instance._has_critic_obs = instance._critic_obs_key is not None
         instance._actor_obs_dim = int(obs_space.spaces[instance._actor_obs_key].shape[0])
         flat_dim = (
             int(obs_space.spaces[instance._critic_obs_key].shape[0])

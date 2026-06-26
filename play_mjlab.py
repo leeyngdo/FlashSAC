@@ -18,15 +18,6 @@ from omegaconf import OmegaConf
 from flash_rl.agents import create_agent
 
 
-def _select_actor_obs_key(obs_groups: list[str]) -> str:
-    for key in ("actor", "policy"):
-        if key in obs_groups:
-            return key
-    if not obs_groups:
-        raise ValueError("mjlab environment exposes no observation groups.")
-    return obs_groups[0]
-
-
 class _MjlabViewerEnv:
     """Thin wrapper that adds get_observations() to ManagerBasedRlEnv (or VideoRecorder).
 
@@ -142,9 +133,11 @@ def play(args: argparse.Namespace) -> None:
 
     # Mirror the obs layout logic from MjlabVectorEnv so the agent matches training.
     obs_groups = list(raw_env.single_observation_space.spaces.keys())
-    actor_key = _select_actor_obs_key(obs_groups)
+    if "actor" not in obs_groups:
+        raise ValueError(f"mjlab env must expose an 'actor' observation group, got {obs_groups}.")
+    actor_key = "actor"
     critic_key = "critic" if "critic" in obs_groups else None
-    has_asymmetric = critic_key is not None and critic_key != actor_key
+    has_asymmetric = critic_key is not None
     actor_dim = int(raw_env.single_observation_space.spaces[actor_key].shape[0])
     if has_asymmetric:
         assert critic_key is not None
