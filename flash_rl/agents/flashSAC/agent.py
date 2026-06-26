@@ -66,7 +66,7 @@ class FlashSACConfig:
 
     temp_initial_value: float
     temp_target_sigma: float
-    temp_target_entropy: Optional[float]
+    temp_target_entropy: float
 
     gamma: float
     n_step: int
@@ -355,10 +355,7 @@ class FlashSACAgent(BaseAgent[FlashSACConfig]):
         else:
             self._actor_observation_dim = self._critic_observation_dim
 
-        if cfg.temp_target_entropy is None:
-            temp_target_entropy = 0.5 * self._action_dim * math.log(2 * math.pi * math.e * cfg.temp_target_sigma**2)
-        else:
-            temp_target_entropy = cfg.temp_target_entropy
+        temp_target_entropy = 0.5 * self._action_dim * math.log(2 * math.pi * math.e * cfg.temp_target_sigma**2)
         compile_mode = _resolve_compile_mode(cfg.compile_mode)
         cfg = replace(cfg, temp_target_entropy=temp_target_entropy, compile_mode=compile_mode)
 

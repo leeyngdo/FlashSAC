@@ -97,9 +97,6 @@ def record_video(
 ) -> dict[str, Any]:
     if num_episodes == 0:
         return {}
-    if env_type == "mjlab":
-        # mjlab recording is handled by play_mjlab.py with mjlab's native VideoRecorder.
-        return {}
     num_envs = env.num_envs
     # assert num_episodes % num_envs == 0, "num_episodes must be divisible by env.num_envs"
     num_eval_episodes_per_env = max(num_episodes // num_envs, 1)
