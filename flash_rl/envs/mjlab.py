@@ -20,10 +20,7 @@ class MjlabVectorEnv(VectorEnv[F32NDArray, F32NDArray, F32NDArray]):
     IsaacLab wrapper where terminal obs is unavailable.
 
     Observations are flattened from mjlab's dict format:
-    - If both "actor" and "critic" groups exist: critic obs is stored (critic is a
-      superset of actor obs). env_info["actor_observation_size"] is always set so
-      FlashSAC's agent slices obs[:actor_dim] for the actor and obs for the critic.
-      This halves buffer memory vs the previous [actor | critic] concatenation.
+    - If both "actor" and "critic" groups exist: critic obs is stored directly.
     - Otherwise: the actor group is used as-is.
 
     Actions are passed through unchanged (mjlab action terms handle scaling internally).
@@ -76,24 +73,12 @@ class MjlabVectorEnv(VectorEnv[F32NDArray, F32NDArray, F32NDArray]):
         # Episode return/length tracking for training-time logging
         self._ep_returns = np.zeros(num_envs, dtype=np.float32)
         self._ep_lengths = np.zeros(num_envs, dtype=np.int32)
-        self._obs_prefix_checked = False
 
     def _flatten_obs(self, obs_dict: dict[str, Any]) -> F32NDArray:
         obs_key = self._critic_obs_key if self._has_critic_obs else self._actor_obs_key
         assert obs_key is not None
         flat = obs_dict[obs_key]
         return flat.cpu().numpy().astype(np.float32)
-
-    def _check_obs_prefix(self, obs_dict: dict[str, Any]) -> None:
-        """Assert critic_obs[:actor_dim] == actor_obs (critic must be a superset)."""
-        assert self._critic_obs_key is not None
-        actor = obs_dict[self._actor_obs_key].float()
-        critic = obs_dict[self._critic_obs_key].float()
-        err = (actor - critic[:, : self._actor_obs_dim]).abs().max().item()
-        assert err < 1e-5, (
-            f"critic_obs[:actor_dim] != actor_obs (max_err={err:.2e}). "
-            "Critic obs must contain actor obs as a prefix for single-buffer storage."
-        )
 
     def reset(
         self,
@@ -104,9 +89,6 @@ class MjlabVectorEnv(VectorEnv[F32NDArray, F32NDArray, F32NDArray]):
         obs_dict, _ = self._env.reset()
         self._ep_returns[:] = 0.0
         self._ep_lengths[:] = 0
-        if self._has_critic_obs and not self._obs_prefix_checked:
-            self._check_obs_prefix(obs_dict)
-            self._obs_prefix_checked = True
         env_info: dict[str, Any] = {}
         if self._has_critic_obs:
             env_info["actor_observation_size"] = (self._actor_obs_dim,)
@@ -217,7 +199,6 @@ class MjlabVectorEnv(VectorEnv[F32NDArray, F32NDArray, F32NDArray]):
         instance.action_size = (action_dim,)
         instance._ep_returns = np.zeros(env.num_envs, dtype=np.float32)
         instance._ep_lengths = np.zeros(env.num_envs, dtype=np.int32)
-        instance._obs_prefix_checked = False
 
         return instance
 

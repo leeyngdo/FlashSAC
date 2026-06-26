@@ -64,10 +64,7 @@ class _FlashSACPolicy:
     """Bridges FlashSAC's sample_actions to mjlab's PolicyProtocol.
 
     Receives the obs dict from env.get_observations() and mirrors exactly what
-    MjlabVectorEnv._flatten_obs does: if critic observations are available, use
-    critic obs directly and rely on critic_obs[:actor_dim] being actor obs.
-    sample_actions then handles the asymmetric_observation flag internally
-    (slicing to actor-only dim if True, using the full flat obs if False).
+    MjlabVectorEnv._flatten_obs does.
     """
 
     def __init__(self, agent: Any, device: str, obs_key: str) -> None:
