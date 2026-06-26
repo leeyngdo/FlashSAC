@@ -205,7 +205,7 @@ class MotionLoader:
     def _compute_frame_blend(self, times: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         phase = times / self.duration
         index_0 = (phase * (self.input_frames - 1)).floor().long()
-        index_1 = torch.minimum(index_0 + 1, torch.tensor(self.input_frames - 1))
+        index_1 = torch.minimum(index_0 + 1, index_0.new_tensor(self.input_frames - 1))
         blend = phase * (self.input_frames - 1) - index_0
         return index_0, index_1, blend
 

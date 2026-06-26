@@ -11,8 +11,9 @@ from isaaclab.utils.types import ArticulationActions
 class DelayedImplicitActuator(ImplicitActuator):
     """Ideal PD actuator with delayed command application.
 
-    This class extends the :class:`IdealPDActuator` class by adding a delay to the actuator commands. The delay
-    is implemented using a circular buffer that stores the actuator commands for a certain number of physics steps.
+    This class extends the :class:`~isaaclab.actuators.ImplicitActuator` class by adding a delay to the actuator
+    commands. The delay is implemented using a circular buffer that stores the actuator commands for a certain number
+    of physics steps.
     The most recent actuation value is pushed to the buffer at every physics step, but the final actuation value
     applied to the simulation is lagged by a certain number of physics steps.
 
@@ -64,7 +65,7 @@ class DelayedImplicitActuator(ImplicitActuator):
         control_action.joint_positions = self.positions_delay_buffer.compute(control_action.joint_positions)
         control_action.joint_velocities = self.velocities_delay_buffer.compute(control_action.joint_velocities)
         control_action.joint_efforts = self.efforts_delay_buffer.compute(control_action.joint_efforts)
-        # compte actuator model
+        # compute actuator model
         return super().compute(control_action, joint_pos, joint_vel)
 
 

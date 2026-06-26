@@ -15,7 +15,7 @@
 NUM_GPUS=${NUM_GPUS:-$(python -c "import torch; print(torch.cuda.device_count())")}
 
 # Hydra list literal syntax: ["/path/a.npz","/path/b.npz"] or a directory "/path/motions".
-MOTION_FILES='[/home/ubuntu/youngdo/FlashSAC/flash_rl/envs/isaaclab_envs/motions/TODO_REPLACE_ME.npz]'
+: "${MOTION_FILES:?Set MOTION_FILES to a Hydra list literal (e.g. '[\"/path/a.npz\"]') or a directory of .npz clips}"
 
 seeds=( 0 1000 2000 3000 4000 )
 
