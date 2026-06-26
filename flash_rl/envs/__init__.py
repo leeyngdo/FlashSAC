@@ -89,6 +89,13 @@ def create_envs(
             env_name=env_name,
             num_envs=num_train_envs,
             seed=seed,
+            reward=kwargs.get("reward"),
+            observation=kwargs.get("observation"),
+            termination=kwargs.get("termination"),
+            robot=kwargs.get("robot"),
+            motion=kwargs.get("motion"),
+            cfg_overrides=kwargs.get("cfg_overrides"),
+            action_bound=kwargs.get("action_bound"),
         )
         # NOTE: IsaacLab/IsaacSim only supports one SimulationApp instance per process by design.
         # See https://github.com/isaac-sim/IsaacLab/discussions/1241

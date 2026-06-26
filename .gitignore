@@ -162,3 +162,13 @@ tmp/**
 
 # saved checkpoints
 models/**
+models
+# IsaacLab motion-tracking assets (large; fetch locally, do not commit)
+flash_rl/envs/isaaclab_envs/assets/unitree_description/
+flash_rl/envs/isaaclab_envs/motions/*.npz
+flash_rl/envs/isaaclab_envs/motions/lafan1_csv/
+
+# local experiment / agent artifacts (do not commit)
+runs/
+*.mp4
+.claude/
