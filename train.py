@@ -129,7 +129,10 @@ def run(args: argparse.Namespace) -> None:
     # load model if given
     script_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
     save_path_resolved = cfg.save_path.replace("TIMESTAMP", datetime.now().strftime("%m%d-%H%M%S"))
-    save_path_base = script_dir + "/" + save_path_resolved
+    if os.path.isabs(save_path_resolved):
+        save_path_base = save_path_resolved
+    else:
+        save_path_base = os.path.join(script_dir, save_path_resolved)
     if cfg.agent_load_path is not None:
         load_path = os.path.join(script_dir, cfg.agent_load_path)
         agent.load(load_path)
@@ -139,7 +142,11 @@ def run(args: argparse.Namespace) -> None:
 
     # initial evaluation (rank 0 only; other ranks wait at the barrier)
     if main_rank:
-        eval_info = evaluate(agent, eval_env, cfg.num_eval_episodes, cfg.env.env_type)
+        eval_info = (
+            evaluate(agent, eval_env, cfg.num_eval_episodes, cfg.env.env_type)
+            if cfg.num_eval_episodes > 0
+            else {}
+        )
         video_info = record_video(agent, record_env, cfg.num_record_episodes, cfg.env.env_type)
         logger.update_metric(**eval_info)
         logger.update_metric(**video_info)
@@ -252,7 +259,11 @@ def run(args: argparse.Namespace) -> None:
 
     # final evaluation (rank 0 only)
     if main_rank:
-        eval_info = evaluate(agent, eval_env, cfg.num_eval_episodes, cfg.env.env_type)
+        eval_info = (
+            evaluate(agent, eval_env, cfg.num_eval_episodes, cfg.env.env_type)
+            if cfg.num_eval_episodes > 0
+            else {}
+        )
         video_info = record_video(agent, record_env, cfg.num_record_episodes, cfg.env.env_type)
         logger.update_metric(**eval_info)
         logger.update_metric(**video_info)
