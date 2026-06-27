@@ -1,12 +1,9 @@
-"""Assembler: declarative ``dexmanip/*_cfg.py`` modules -> ``ManagerBasedRlEnvCfg``.
+"""DexManip env cfg bridge.
 
-Replaces DexManip's Hydra-driven ``src/envs/__init__.py:make_env_cfg``.
-``_build_native_env_cfg`` composes the FlashSAC-owned ``mdp/`` term functions +
-``dexmanip/*_cfg.py`` wiring + ``robots/xhand.py`` into a self-contained env cfg
-(no ``$DEXMANIP_SRC`` dependency). ``build_dexmanip_env_cfg`` dispatches to it by
-default; set ``DEXMANIP_STOPGAP=1`` to fall back to DexManip's original
-``make_env_cfg`` (kept for A/B comparison against the known-good reference:
-actor+critic obs = 453, action = 18).
+The default path intentionally delegates to the editable DexManip checkout
+(``feat/youngdo/flashsac``) and its ``envs.make_env_cfg``. The local
+``mjlab_envs/mdp`` implementation is kept as an opt-in native/override surface,
+not as the source of truth for the environment.
 """
 
 from __future__ import annotations
@@ -93,12 +90,12 @@ def build_dexmanip_env_cfg(
 ) -> Any:
     """Build a ManagerBasedRlEnvCfg for the dexmanip motion-tracking task.
 
-    Native (self-contained) by default; ``DEXMANIP_STOPGAP=1`` forces the
-    DexManip-clone path. Both produce a 453-dim actor+critic obs / 18-dim action env.
+    DexManip editable checkout by default; set ``DEXMANIP_NATIVE=1`` only when
+    explicitly A/B testing the local native cfg assembly.
     """
-    if os.environ.get("DEXMANIP_STOPGAP"):
-        return _build_stopgap_env_cfg(env_name, num_envs=num_envs, seed=seed, device=device, motion=motion)
-    return _build_native_env_cfg(env_name, num_envs=num_envs, seed=seed, device=device, motion=motion)
+    if os.environ.get("DEXMANIP_NATIVE"):
+        return _build_native_env_cfg(env_name, num_envs=num_envs, seed=seed, device=device, motion=motion)
+    return _build_upstream_env_cfg(env_name, num_envs=num_envs, seed=seed, device=device, motion=motion)
 
 
 def _build_native_env_cfg(
@@ -157,13 +154,11 @@ def _build_native_env_cfg(
     )
 
 
-def _build_stopgap_env_cfg(
+def _build_upstream_env_cfg(
     env_name: str, *, num_envs: int, seed: int, device: str = "cuda:0", motion: Any = None
 ) -> Any:
-    """Fallback: build via DexManip's original ``make_env_cfg`` ($DEXMANIP_SRC clone).
-
-    Kept for A/B comparison against the native assembly. Needs the DexManip clone.
-    """
+    """Build via DexManip's original ``make_env_cfg`` ($DEXMANIP_SRC clone)."""
+    del env_name  # DexManip's Hydra config owns the concrete env preset.
     import hydra
     from hydra.core.global_hydra import GlobalHydra
     from omegaconf import OmegaConf
