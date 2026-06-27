@@ -185,5 +185,9 @@ ignore_errors = true
 module = "flash_rl.envs.isaaclab_envs.*"
 ignore_errors = true
 
+[[tool.mypy.overrides]]
+module = "flash_rl.envs.mjlab_envs.*"
+ignore_errors = true
+
 [tool.setuptools.packages.find]
 include = ["flash_rl*"]

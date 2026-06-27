@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Union
+from typing import Any, Optional, Union
 
 import gymnasium as gym
 import numpy as np
@@ -9,6 +9,14 @@ from gymnasium.vector import VectorEnv
 from gymnasium.vector.utils import batch_space
 
 from ..types import F32NDArray, NDArray
+
+# Local (non-registry) mjlab tasks whose cfg + MDP terms live in the
+# flash_rl.envs.mjlab_envs content package. Mirrors
+# flash_rl.envs.isaaclab.LOCAL_ISAACLAB_TASKS: the wrapper module here
+# orchestrates, the env package provides the content (cfg builder + overrides).
+LOCAL_MJLAB_TASKS: dict[str, str] = {
+    "DexManip-MotionTracking-XHand-Right": "flash_rl.envs.mjlab_envs.dexmanip",
+}
 
 
 class MjlabVectorEnv(VectorEnv[F32NDArray, F32NDArray, F32NDArray]):
@@ -210,3 +218,53 @@ def make_mjlab_env(
     device: str = "cuda:0",
 ) -> MjlabVectorEnv:
     return MjlabVectorEnv(task_id=task_id, num_envs=num_envs, seed=seed, device=device)
+
+
+def make_dexmanip_env(
+    env_name: str,
+    num_envs: int,
+    seed: int,
+    device: str = "cuda:0",
+    *,
+    motion: Any = None,
+    reward: Optional[dict[str, Any]] = None,
+    observation: Optional[dict[str, Any]] = None,
+    event: Optional[dict[str, Any]] = None,
+    action: Optional[dict[str, Any]] = None,
+    termination: Optional[dict[str, Any]] = None,
+    robot: Optional[dict[str, Any]] = None,
+    cfg_overrides: Optional[dict[str, Any]] = None,
+) -> MjlabVectorEnv:
+    """Build a local (non-registry) mjlab task from ``mjlab_envs`` and wrap it for SAC.
+
+    The dexmanip analogue of :func:`make_mjlab_env`. Where ``make_mjlab_env`` pulls
+    a cfg from mjlab's task *registry* (``load_env_cfg``), this reaches DOWN into the
+    ``flash_rl.envs.mjlab_envs`` content package for the cfg assembly + per-term
+    override seam — top-down, mirroring ``isaaclab.make_isaaclab_env -> isaaclab_envs``.
+    Both paths then share the exact same wrapper (``MjlabVectorEnv.from_env``:
+    auto_reset=False, actor/critic obs, terminal-obs capture for SAC bootstrapping).
+
+    ``motion`` is the packed ``motion.pt`` path the motion command eager-loads at
+    __init__ (no data -> no env). ``reward``/``observation``/``event``/``action``/
+    ``termination``/``robot`` are per-term override dicts from ``configs/env/dexmanip.yaml``.
+    """
+    from mjlab.envs import ManagerBasedRlEnv
+
+    from .mjlab_envs.dexmanip import apply_dexmanip_overrides, build_dexmanip_env_cfg
+
+    if env_name not in LOCAL_MJLAB_TASKS:
+        print(f"[mjlab] '{env_name}' not in LOCAL_MJLAB_TASKS; building with the default dexmanip preset.")
+
+    env_cfg = build_dexmanip_env_cfg(env_name, num_envs=num_envs, seed=seed, device=device, motion=motion)
+    apply_dexmanip_overrides(
+        env_cfg,
+        reward=reward,
+        observation=observation,
+        event=event,
+        action=action,
+        termination=termination,
+        robot=robot,
+        cfg_overrides=cfg_overrides,
+    )
+    env = ManagerBasedRlEnv(cfg=env_cfg, device=device)
+    return MjlabVectorEnv.from_env(env)

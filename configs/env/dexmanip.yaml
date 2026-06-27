@@ -1,0 +1,39 @@
+# @package _global_
+
+##################################################################################
+# DexManip — 5-finger dexterous motion tracking (mjlab GPU simulator)
+#
+# Ported from DAVIAN-Robotics/DexManip into flash_rl/envs/mjlab_envs/.
+# Requires a Python env with the DAVIAN mjlab fork, MuJoCo stack, and local
+# DexManip assets installed.
+##################################################################################
+
+num_record_episodes: 0
+
+env:
+  env_type: 'dexmanip'
+  env_name: 'DexManip-MotionTracking-XHand-Right'
+  num_env_steps: ${num_env_steps}
+
+  seed: ${seed}
+  num_train_envs: ${num_train_envs}
+  num_eval_envs: null            # single sim instance (mjlab); eval == train env
+  num_record_envs: null
+  rescale_action: null           # mjlab action terms scale internally
+  max_episode_steps: null        # taken from episode_length_s / decimation
+  device: null                   # null = auto (cuda:0 if available)
+
+  # Path to a packed with-object motion.pt (under $DATA_DIR). REQUIRED to
+  # construct the env — the motion command eager-loads it at __init__.
+  motion: null
+
+  # ── term-configuration surface (isaaclab_envs-style; applied by
+  #    dexmanip/overrides.apply_dexmanip_overrides). Leave null to use the
+  #    weights/params declared in flash_rl/envs/mjlab_envs/dexmanip/*_cfg.py. ──
+  reward: null                   # e.g. {tracking_r_obj_trans_error_exp: {weight: 5.0}}
+  observation: null              # e.g. {critic: {obj_trans_relative: {enabled: false}}}
+  event: null
+  action: null
+  termination: null
+  robot: null
+  cfg_overrides: null            # flat dotted-path overrides onto the env cfg

@@ -168,6 +168,13 @@ flash_rl/envs/isaaclab_envs/assets/unitree_description/
 flash_rl/envs/isaaclab_envs/motions/*.npz
 flash_rl/envs/isaaclab_envs/motions/lafan1_csv/
 
+# Isolated dexmanip env + vendored mjlab fork (build locally; lives on nvme by default).
+.venv*/
+/third_party/
+
+# DexManip assets (large/upstream-owned; fetch locally, do not commit).
+flash_rl/envs/mjlab_envs/assets/
+
 # local experiment / agent artifacts (do not commit)
 runs/
 *.mp4
