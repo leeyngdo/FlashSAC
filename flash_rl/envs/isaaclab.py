@@ -257,9 +257,7 @@ class IsaacLabVectorEnv(
         infos.update({"actor_observation_size": self.obs_size, "asymmetric_obs": self.asymmetric_obs})
         return obs, infos
 
-    def step(
-        self, actions: Union[torch.Tensor, F32NDArray]
-    ) -> tuple[
+    def step(self, actions: Union[torch.Tensor, F32NDArray]) -> tuple[
         Union[torch.Tensor, F32NDArray],
         Union[torch.Tensor, F32NDArray],
         Union[torch.Tensor, F32NDArray],
@@ -304,7 +302,7 @@ class IsaacLabVectorEnv(
             rew = rew.cpu().numpy()
             terminations = terminations.cpu().numpy()
             truncations = truncations.cpu().numpy()
-            infos = recursive_to_numpy(infos)
+            infos = cast(dict[str, Any], recursive_to_numpy(infos))
         return obs, rew, terminations, truncations, infos
 
     def close(self, **kwargs: Any) -> None:

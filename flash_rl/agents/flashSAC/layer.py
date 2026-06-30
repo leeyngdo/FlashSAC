@@ -118,6 +118,10 @@ class FlashSACBlock(nn.Module):
 
 
 class NormalTanhPolicy(nn.Module):
+    action_bias: torch.Tensor
+    action_range: torch.Tensor
+    log_action_range: torch.Tensor
+
     def __init__(
         self,
         hidden_dim: int,
