@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Union
+from typing import Any, Union, cast
 
 import gymnasium as gym
 import numpy as np
@@ -57,7 +57,8 @@ class MjlabVectorEnv(VectorEnv[F32NDArray, F32NDArray, F32NDArray]):
         self._critic_obs_key = "critic" if "critic" in obs_groups else None
         self._has_critic_obs = self._critic_obs_key is not None
         self._actor_obs_dim = int(obs_space.spaces[self._actor_obs_key].shape[0])
-        flat_dim = int(obs_space.spaces[self._critic_obs_key].shape[0]) if self._has_critic_obs else self._actor_obs_dim
+        critic_obs_key = self._critic_obs_key
+        flat_dim = int(obs_space.spaces[critic_obs_key].shape[0]) if critic_obs_key is not None else self._actor_obs_dim
 
         action_dim = int(self._env.single_action_space.shape[0])
 
@@ -78,7 +79,7 @@ class MjlabVectorEnv(VectorEnv[F32NDArray, F32NDArray, F32NDArray]):
         obs_key = self._critic_obs_key if self._has_critic_obs else self._actor_obs_key
         assert obs_key is not None
         flat = obs_dict[obs_key]
-        return flat.cpu().numpy().astype(np.float32)
+        return cast(F32NDArray, flat.cpu().numpy().astype(np.float32))
 
     def reset(
         self,
@@ -180,10 +181,9 @@ class MjlabVectorEnv(VectorEnv[F32NDArray, F32NDArray, F32NDArray]):
         instance._critic_obs_key = "critic" if "critic" in obs_groups else None
         instance._has_critic_obs = instance._critic_obs_key is not None
         instance._actor_obs_dim = int(obs_space.spaces[instance._actor_obs_key].shape[0])
+        critic_obs_key = instance._critic_obs_key
         flat_dim = (
-            int(obs_space.spaces[instance._critic_obs_key].shape[0])
-            if instance._has_critic_obs
-            else instance._actor_obs_dim
+            int(obs_space.spaces[critic_obs_key].shape[0]) if critic_obs_key is not None else instance._actor_obs_dim
         )
 
         action_dim = int(env.single_action_space.shape[0])

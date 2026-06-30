@@ -24,7 +24,10 @@ from flash_rl.agents.flashSAC.update import (
 from flash_rl.agents.utils.network import Network
 from flash_rl.agents.utils.reward_normalization import RewardNormalizer
 from flash_rl.agents.utils.scheduler import warmup_cosine_decay_scheduler
-from flash_rl.buffers.torch_buffer import TorchUniformBuffer
+from flash_rl.buffers.torch_buffer import (
+    MemoryEfficientTorchUniformBuffer,
+    TorchUniformBuffer,
+)
 from flash_rl.common.distributed import broadcast_parameters_, resolve_device_type
 from flash_rl.types import NDArray, Tensor
 
@@ -80,6 +83,7 @@ class FlashSACConfig:
     load_reward_normalizer: bool
 
     buffer_obs_dtype: Optional[str] = None
+    buffer_optimize_memory_usage: bool = True
 
 
 def _init_flashsac_networks(
@@ -295,7 +299,7 @@ def _update_networks(
         temperature_info = update_temperature(
             temperature=temperature,
             entropy=actor_info["actor/entropy"],
-            target_entropy=cfg.temp_target_entropy,
+            target_entropy=cast(float, cfg.temp_target_entropy),
         )
     else:
         actor_info = {}
@@ -446,7 +450,8 @@ class FlashSACAgent(BaseAgent[FlashSACConfig]):
 
         # Replay buffer
         _obs_dtype = getattr(torch, self._cfg.buffer_obs_dtype) if self._cfg.buffer_obs_dtype is not None else None
-        self._replay_buffer = TorchUniformBuffer(
+        buffer_cls = MemoryEfficientTorchUniformBuffer if self._cfg.buffer_optimize_memory_usage else TorchUniformBuffer
+        self._replay_buffer = buffer_cls(
             observation_space=observation_space,
             action_space=action_space,
             n_step=self._cfg.n_step,
