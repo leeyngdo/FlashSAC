@@ -5,8 +5,16 @@ import gymnasium as gym
 from ..types import NDArray
 from .base_buffer import BaseBuffer, Batch  # noqa
 from .numpy_buffer import NpyUniformBuffer
+from .torch_buffer import MemoryEfficientTorchUniformBuffer, TorchUniformBuffer
 
-__all__ = ["BaseBuffer", "Batch", "NpyUniformBuffer", "create_buffer"]
+__all__ = [
+    "BaseBuffer",
+    "Batch",
+    "MemoryEfficientTorchUniformBuffer",
+    "NpyUniformBuffer",
+    "TorchUniformBuffer",
+    "create_buffer",
+]
 
 
 def create_buffer(

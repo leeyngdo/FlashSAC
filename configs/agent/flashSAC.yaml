@@ -9,8 +9,10 @@ device_type: 'cuda'
 
 buffer_max_length: 1_000_000
 buffer_min_length: 10_000
-buffer_device_type: 'cuda'
+buffer_device_type: "cuda"
 sample_batch_size: 2048
+buffer_obs_dtype: null
+buffer_optimize_memory_usage: true
 
 normalize_reward: true
 normalized_G_max: 5.0
