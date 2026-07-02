@@ -151,6 +151,16 @@ class IsaacLabVectorEnv(
         # When None, fall back to the policy (+ optional critic) layout.
         self._obs_groups = list(obs_groups) if obs_groups is not None else None
 
+        # Boolean success signal for evaluate(): derived from a pose command term's
+        # position_error/orientation_error metrics (dexsuite-style). Thresholds mirror the
+        # task's own success visualization (pose_commands.py: pos < 0.05 m, rot < 0.5 rad).
+        # Resolved lazily on the first step; None when the task has no such command term,
+        # in which case infos carries no "success" key and eval success stays unreported.
+        self._success_pos_threshold = 0.05
+        self._success_rot_threshold = 0.5
+        self._success_term: Any = None
+        self._success_term_resolved = False
+
         # Get observation/action spaces
         # NOTE: Action range: [-1, 1] * action_bounds (https://github.com/google-deepmind/mujoco_playground/issues/19)
         obs_space = cast(Any, self.envs.unwrapped).single_observation_space
@@ -321,6 +331,10 @@ class IsaacLabVectorEnv(
             if episode_info:
                 infos["episode_info"] = episode_info
 
+        success = self._compute_success()
+        if success is not None:
+            infos["success"] = success
+
         if self.to_numpy:
             obs = obs.cpu().numpy()
             rew = rew.cpu().numpy()
@@ -328,6 +342,30 @@ class IsaacLabVectorEnv(
             truncations = truncations.cpu().numpy()
             infos = cast(dict[str, Any], recursive_to_numpy(infos))
         return obs, rew, terminations, truncations, infos
+
+    def _compute_success(self) -> torch.Tensor | None:
+        """Per-env boolean success from the task's pose command metrics (None when unavailable).
+
+        Matches the dexsuite success criterion: position_error < 0.05 m AND
+        orientation_error < 0.5 rad against the commanded pose. Requires BOTH metrics on the
+        command term so unrelated tasks (whose metrics mean something else) are not
+        misreported.
+        """
+        if not self._success_term_resolved:
+            self._success_term_resolved = True
+            command_manager = getattr(self.envs.unwrapped, "command_manager", None)
+            if command_manager is not None:
+                for name in getattr(command_manager, "active_terms", []):
+                    metrics = getattr(command_manager.get_term(name), "metrics", None)
+                    if metrics and "position_error" in metrics and "orientation_error" in metrics:
+                        self._success_term = command_manager.get_term(name)
+                        break
+        if self._success_term is None:
+            return None
+        metrics = self._success_term.metrics
+        return (metrics["position_error"] < self._success_pos_threshold) & (
+            metrics["orientation_error"] < self._success_rot_threshold
+        )
 
     def close(self, **kwargs: Any) -> None:
         # self.envs.close(**kwargs)

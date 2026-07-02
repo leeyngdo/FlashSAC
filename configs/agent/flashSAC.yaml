@@ -56,3 +56,25 @@ use_amp: true
 
 load_optimizer: true
 load_reward_normalizer: true
+
+##################################################################################
+# SAPG (Split and Aggregate Policy Gradients) - multi-policy diverse exploration
+# sapg_enabled=false => vanilla SAC. Requires num_train_envs % sapg_num_agents == 0.
+##################################################################################
+sapg_enabled: false
+sapg_num_agents: 4
+sapg_agent_latent_dim: 32
+sapg_leader_id: 0
+sapg_off_policy_ratio: 1
+# Diversity pressure (SAC analogue of SAPG's graded entropy bonus): follower at cyclic rank r
+# (r = (agent_id - leader_id) mod M) targets `temp_target_entropy + r * grading` nats; the
+# leader keeps the base target. 0 disables.
+sapg_target_entropy_grading: 0.0
+# Recency-biased (truncated-geometric / "GEOM") replay sampling. buffer_geom_alpha biases the
+# global sample() toward recent data (0 => exact uniform legacy behavior; mean sample age
+# ~ capacity/(alpha*ln2)). sapg_geom_alphas: optional per-agent alphas for SAPG block sampling
+# (length sapg_num_agents; alpha of the block sampled FROM) — e.g. [0, 30, 100, 300] keeps the
+# leader a uniform aggregator while grading followers toward quasi-on-policy. null => all use
+# buffer_geom_alpha.
+buffer_geom_alpha: 0.0
+sapg_geom_alphas: null

@@ -155,6 +155,7 @@ def run(args: argparse.Namespace) -> None:
     update_info = {}
     global_interaction_step = 0
     env_step = 0
+    last_checkpoint_global_step: Optional[int] = None
 
     for interaction_step in tqdm.tqdm(
         range(1, num_interaction_steps + 1),
@@ -241,6 +242,7 @@ def run(args: argparse.Namespace) -> None:
                 if main_rank:
                     save_path = os.path.join(save_path_base, f"step{global_interaction_step}")
                     agent.save(save_path)
+                    last_checkpoint_global_step = global_interaction_step
                 barrier()
 
             # save buffer (rank 0 only; barrier guards against a long write tripping NCCL)
@@ -249,6 +251,15 @@ def run(args: argparse.Namespace) -> None:
                     save_path = os.path.join(save_path_base, f"step{global_interaction_step}")
                     agent.save_replay_buffer(save_path)
                 barrier()
+
+    # Distributed interval scaling can round the last checkpoint interval past the
+    # final local step. Always leave a final policy checkpoint when checkpointing
+    # is enabled.
+    if save_checkpoint_per_interaction_step and global_interaction_step > 0:
+        if main_rank and last_checkpoint_global_step != global_interaction_step:
+            save_path = os.path.join(save_path_base, f"step{global_interaction_step}")
+            agent.save(save_path)
+        barrier()
 
     # final evaluation (rank 0 only)
     if main_rank:

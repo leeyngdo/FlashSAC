@@ -1,4 +1,4 @@
-from typing import Any, Optional
+from typing import Any, Optional, cast
 
 import torch
 from torch.amp.grad_scaler import GradScaler
@@ -86,6 +86,8 @@ def update_actor(
     device: torch.device,
     use_amp: bool,
     grad_scaler: Optional[GradScaler],
+    num_agents: int = 1,
+    leader_id: int = 0,
 ) -> dict[str, torch.Tensor]:
     """Update actor network.
 
@@ -101,10 +103,13 @@ def update_actor(
     """
 
     with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
+        agent_ids = cast(Optional[torch.Tensor], batch.get("agent_id"))
         actor_obs_all = torch.cat([batch["actor_observation"], batch["actor_next_observation"]], dim=0)  # type: ignore
+        actor_agent_ids_all = torch.cat([agent_ids, agent_ids], dim=0) if agent_ids is not None else None
         actions_all, info = actor(
             observations=actor_obs_all,
             training=True,
+            agent_ids=actor_agent_ids_all,
         )
         log_probs_all = info["log_prob"]
 
@@ -113,15 +118,16 @@ def update_actor(
 
         # Disable critic gradients to prevent CUDA graph overwriting
         critic.network.requires_grad_(False)
-        qs, q_infos = critic(
+        qs, _ = critic(
             observations=batch["observation"],
             actions=actions,
             training=False,
+            agent_ids=agent_ids,
         )
         q = torch.minimum(qs[0], qs[1])
         critic.network.requires_grad_(True)
 
-        temp_value = temperature().detach()
+        temp_value = temperature(agent_ids).detach() if agent_ids is not None else temperature().detach()
         actor_loss = (log_probs * temp_value - q).mean()
 
         if bc_alpha > 0:
@@ -130,8 +136,19 @@ def update_actor(
             bc_loss = ((actions - batch["action"]) ** 2).mean()
             actor_loss = actor_loss + bc_alpha * q_abs * bc_loss
 
-        entropy = -log_probs.mean()
+        entropy_samples = -log_probs
+        entropy = entropy_samples.mean()
         mean_action = actions.mean()
+
+        agent_entropy_info = {}
+        if num_agents > 1 and agent_ids is not None:
+            leader_mask = agent_ids == leader_id
+            if leader_mask.any():
+                agent_entropy_info["entropy_leader"] = entropy_samples[leader_mask].mean()
+            for agent_id in range(num_agents):
+                agent_mask = agent_ids == agent_id
+                if agent_mask.any():
+                    agent_entropy_info[f"entropy_agent_{agent_id}"] = entropy_samples[agent_mask].mean()
 
     # Gradient step
     assert actor.optimizer is not None
@@ -162,8 +179,12 @@ def update_actor(
         "loss": actor_loss,
         "entropy": entropy,
         "mean_action": mean_action,
+        **agent_entropy_info,
     }
     update_info = add_prefix_to_keys(update_info, "actor")
+    update_info["_temperature_entropy"] = entropy_samples.detach()
+    if agent_ids is not None:
+        update_info["_temperature_agent_ids"] = agent_ids.detach()
 
     return update_info
 
@@ -204,19 +225,25 @@ def update_critic(
     with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
         # Compute target values
         with torch.no_grad():
+            # SAPG: condition the (target) critic and next-action policy on the policy id selected
+            # by the sampler. Followers only receive their own collected rows; the leader receives
+            # globally sampled rows retagged with the leader id.
+            agent_ids = cast(Optional[torch.Tensor], batch.get("agent_id"))
             next_actions, info = actor(
                 observations=batch["actor_next_observation"],
                 training=False,
+                agent_ids=agent_ids,
             )
             # Clone variables to prevent overwriting
             next_actions = next_actions.clone()
             next_actor_log_probs = info["log_prob"].clone()
 
-            temp_value = temperature()
+            temp_value = temperature(agent_ids) if agent_ids is not None else temperature()
 
             next_actor_entropy = temp_value * next_actor_log_probs
             obs_all = torch.cat([batch["observation"], batch["next_observation"]], dim=0)  # type: ignore
             act_all = torch.cat([batch["action"], next_actions], dim=0)  # type: ignore
+            ids_all = torch.cat([agent_ids, agent_ids], dim=0) if agent_ids is not None else None
 
             # qs_all: (2, 2*B)
             # q_infos_all['log_probs']: (2, 2*B, num_bins)
@@ -224,6 +251,7 @@ def update_critic(
                 observations=obs_all,
                 actions=act_all,
                 training=True,
+                agent_ids=ids_all,
             )
             next_qs = qs_all.chunk(2, dim=1)[1]
             next_q_log_probs = q_infos_all["log_prob"].chunk(2, dim=1)[1]
@@ -247,6 +275,7 @@ def update_critic(
             observations=obs_all,
             actions=act_all,
             training=True,
+            agent_ids=ids_all,
         )
         pred_log_probs = torch.chunk(pred_q_infos["log_prob"], 2, dim=1)[0]
 
@@ -300,17 +329,29 @@ def update_temperature(
     temperature: Network,
     entropy: torch.Tensor,
     target_entropy: float,
+    agent_ids: Optional[torch.Tensor] = None,
+    target_entropy_offsets: Optional[torch.Tensor] = None,
 ) -> dict[str, torch.Tensor]:
     """Update temperature network.
 
     Args:
         temperature: Temperature network.
-        entropy: Current entropy value.
+        entropy: Current entropy value(s).
         target_entropy: Target entropy value.
+        agent_ids: Training agent id per entropy sample. When present, each sample updates
+            only that agent's temperature.
+        target_entropy_offsets: Per-agent additive offsets on ``target_entropy`` (SAPG
+            diversity grading: leader 0, followers > 0). Indexed by ``agent_ids``; ignored
+            when either is None.
     """
 
     temperature_value = temperature().clone()
-    temperature_loss = temperature_value * (entropy.detach() - target_entropy).mean()
+    selected_temperature = temperature(agent_ids) if agent_ids is not None else temperature_value
+    if agent_ids is not None and target_entropy_offsets is not None:
+        selected_target = target_entropy + target_entropy_offsets[agent_ids]
+    else:
+        selected_target = target_entropy
+    temperature_loss = (selected_temperature * (entropy.detach() - selected_target)).mean()
 
     assert temperature.optimizer is not None
     temperature.optimizer.zero_grad(set_to_none=True)
@@ -321,9 +362,12 @@ def update_temperature(
         temperature.scheduler.step()
 
     update_info = {
-        "value": temperature_value,
+        "value": temperature_value.mean(),
         "loss": temperature_loss,
     }
+    if temperature_value.numel() > 1:
+        for agent_id, value in enumerate(temperature_value):
+            update_info[f"value_agent_{agent_id}"] = value
     update_info = add_prefix_to_keys(update_info, "temperature")
 
     return update_info

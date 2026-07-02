@@ -85,6 +85,29 @@ class FlashSACConfig:
     buffer_obs_dtype: Optional[str] = None
     buffer_optimize_memory_usage: bool = True
 
+    # SAPG (Split and Aggregate Policy Gradients): multi-policy diverse exploration on top of SAC.
+    # When disabled, the agent is exactly vanilla SAC (single policy, no per-agent latent).
+    sapg_enabled: bool = False
+    sapg_num_agents: int = 1
+    sapg_agent_latent_dim: int = 32
+    sapg_leader_id: int = 0
+    sapg_off_policy_ratio: int = 1
+    # Per-agent temperature target-entropy grading (SAC analogue of SAPG's graded entropy
+    # bonus, where the leader's coefficient is 0 and followers' grow with rank). The leader
+    # keeps the base target entropy; the follower at cyclic rank r (r = (agent_id - leader_id)
+    # mod M) targets `temp_target_entropy + r * sapg_target_entropy_grading` nats. Positive
+    # values push followers toward higher-entropy, more exploratory policies. 0 disables.
+    sapg_target_entropy_grading: float = 0.0
+
+    # Recency-biased ("GEOM" / truncated-geometric) replay sampling. buffer_geom_alpha biases
+    # the global sample() distribution toward recent transitions (0 => exact uniform legacy
+    # behavior). sapg_geom_alphas optionally gives each SAPG agent its own alpha for block
+    # sampling (length sapg_num_agents; the alpha of the block being sampled FROM, including
+    # the leader's donor draws) — e.g. leader 0 (uniform aggregator) with followers graded
+    # toward quasi-on-policy. null => all agents use buffer_geom_alpha.
+    buffer_geom_alpha: float = 0.0
+    sapg_geom_alphas: Optional[tuple[float, ...]] = None
+
 
 def _init_flashsac_networks(
     actor_observation_dim: int,
@@ -94,6 +117,8 @@ def _init_flashsac_networks(
     action_range: torch.Tensor,
     cfg: FlashSACConfig,
     device: torch.device,
+    num_agents: int = 1,
+    agent_latent_dim: int = 0,
 ) -> tuple[Network, Network, Network, Network]:
     # Create learning rate schedule
     warmup_cosine_decay_lr = warmup_cosine_decay_scheduler(
@@ -112,6 +137,8 @@ def _init_flashsac_networks(
         action_dim=action_dim,
         action_bias=action_bias,
         action_range=action_range,
+        num_agents=num_agents,
+        agent_latent_dim=agent_latent_dim,
     ).to(device)
 
     use_fused = device.type == "cuda" and torch.cuda.is_available()
@@ -140,6 +167,8 @@ def _init_flashsac_networks(
         num_bins=cfg.critic_num_bins,
         min_v=cfg.critic_min_v,
         max_v=cfg.critic_max_v,
+        num_agents=num_agents,
+        agent_latent_dim=agent_latent_dim,
     ).to(device)
 
     critic_optimizer = optim.Adam(
@@ -168,6 +197,8 @@ def _init_flashsac_networks(
         num_bins=cfg.critic_num_bins,
         min_v=cfg.critic_min_v,
         max_v=cfg.critic_max_v,
+        num_agents=num_agents,
+        agent_latent_dim=agent_latent_dim,
     ).to(device)
     target_critic_net.load_state_dict(critic_net.state_dict())
     target_critic = Network(
@@ -182,7 +213,7 @@ def _init_flashsac_networks(
     )
 
     # Initialize temperature
-    temp_net = FlashSACTemperature(cfg.temp_initial_value).to(device)
+    temp_net = FlashSACTemperature(cfg.temp_initial_value, num_agents=num_agents).to(device)
     temp_optimizer = optim.Adam(
         temp_net.parameters(),
         lr=cfg.learning_rate_peak,
@@ -242,6 +273,7 @@ def _sample_flashsac_actions(
     cur_count: torch.Tensor,
     cur_n: torch.Tensor,
     zeta_cdf: torch.Tensor,
+    agent_ids: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Sample actions with noise repeat logic fully in torch."""
     # forward actor → distribution mean and std
@@ -249,6 +281,7 @@ def _sample_flashsac_actions(
         "get_mean_and_std",
         observations=observations,
         training=False,
+        agent_ids=agent_ids,
     )
     # return deterministic actions without changing noise sampling params
     if temperature == 0.0:
@@ -281,6 +314,7 @@ def _update_networks(
     do_actor_update: bool,
     device: torch.device,
     grad_scaler: Optional[GradScaler],
+    target_entropy_offsets: Optional[torch.Tensor] = None,
 ) -> dict[str, torch.Tensor]:
     if do_actor_update:
         # Update actor
@@ -293,13 +327,19 @@ def _update_networks(
             device=device,
             use_amp=cfg.use_amp,
             grad_scaler=grad_scaler,
+            num_agents=(cfg.sapg_num_agents if cfg.sapg_enabled else 1),
+            leader_id=cfg.sapg_leader_id,
         )
+        temperature_entropy = cast(torch.Tensor, actor_info.pop("_temperature_entropy"))
+        temperature_agent_ids = cast(Optional[torch.Tensor], actor_info.pop("_temperature_agent_ids", None))
 
         # Update temperature
         temperature_info = update_temperature(
             temperature=temperature,
-            entropy=actor_info["actor/entropy"],
+            entropy=temperature_entropy,
             target_entropy=cast(float, cfg.temp_target_entropy),
+            agent_ids=temperature_agent_ids,
+            target_entropy_offsets=target_entropy_offsets,
         )
     else:
         actor_info = {}
@@ -397,6 +437,41 @@ class FlashSACAgent(BaseAgent[FlashSACConfig]):
             cfg,
         )
         self._cfg = cfg
+        # SAPG: effective policy count / latent dim (1 / 0 -> vanilla SAC).
+        if cfg.sapg_enabled:
+            if cfg.sapg_num_agents < 2:
+                raise ValueError(f"sapg_num_agents must be >= 2 when SAPG is enabled, got {cfg.sapg_num_agents}.")
+            if cfg.sapg_agent_latent_dim <= 0:
+                raise ValueError(
+                    "sapg_agent_latent_dim must be > 0 when SAPG is enabled, "
+                    f"got {cfg.sapg_agent_latent_dim}."
+                )
+            if not 0 <= cfg.sapg_leader_id < cfg.sapg_num_agents:
+                raise ValueError(
+                    f"sapg_leader_id must be in [0, {cfg.sapg_num_agents}), got {cfg.sapg_leader_id}."
+                )
+            if cfg.sapg_off_policy_ratio < 0:
+                raise ValueError(f"sapg_off_policy_ratio must be >= 0, got {cfg.sapg_off_policy_ratio}.")
+            if cfg.sapg_geom_alphas is not None and len(cfg.sapg_geom_alphas) != cfg.sapg_num_agents:
+                raise ValueError(
+                    f"sapg_geom_alphas must have length sapg_num_agents={cfg.sapg_num_agents}, "
+                    f"got {len(cfg.sapg_geom_alphas)}."
+                )
+        elif cfg.sapg_geom_alphas is not None:
+            raise ValueError("sapg_geom_alphas requires sapg_enabled=true.")
+        self._sapg_num_agents = cfg.sapg_num_agents if cfg.sapg_enabled else 1
+        self._sapg_agent_latent_dim = cfg.sapg_agent_latent_dim if cfg.sapg_enabled else 0
+        self._sapg_leader_id = cfg.sapg_leader_id
+        # Per-agent target-entropy offsets for the temperature update: leader (cyclic rank 0)
+        # keeps the base target, follower at rank r gets `+ r * sapg_target_entropy_grading`.
+        # None when disabled -> update_temperature behaves exactly as before.
+        if cfg.sapg_enabled and cfg.sapg_target_entropy_grading != 0.0:
+            ranks = (torch.arange(cfg.sapg_num_agents) - cfg.sapg_leader_id) % cfg.sapg_num_agents
+            self._sapg_target_entropy_offsets: Optional[torch.Tensor] = (
+                cfg.sapg_target_entropy_grading * ranks.to(torch.float32)
+            ).to(self._device)
+        else:
+            self._sapg_target_entropy_offsets = None
 
         # Initialize networks
         (
@@ -412,6 +487,8 @@ class FlashSACAgent(BaseAgent[FlashSACConfig]):
             action_range=self._action_range,
             cfg=self._cfg,
             device=self._device,
+            num_agents=self._sapg_num_agents,
+            agent_latent_dim=self._sapg_agent_latent_dim,
         )
         # Sync initial weights from rank 0 so every data-parallel rank starts identical.
         # No-op when training in a single process.
@@ -461,6 +538,11 @@ class FlashSACAgent(BaseAgent[FlashSACConfig]):
             sample_batch_size=self._cfg.sample_batch_size,
             device_type=resolve_device_type(self._cfg.buffer_device_type),
             obs_storage_dtype=_obs_dtype,
+            num_agents=self._sapg_num_agents,
+            geom_alpha=self._cfg.buffer_geom_alpha,
+            agent_geom_alphas=(
+                [float(a) for a in self._cfg.sapg_geom_alphas] if self._cfg.sapg_geom_alphas is not None else None
+            ),
         )
 
     def sample_actions(
@@ -480,6 +562,25 @@ class FlashSACAgent(BaseAgent[FlashSACConfig]):
 
         observations = torch.as_tensor(observations, dtype=torch.float32).to(self._device)
 
+        # SAPG: assign each env to its policy/block during training; use the leader for every env at
+        # eval. None (disabled) -> the networks ignore agent ids and behave as vanilla SAC.
+        if self._sapg_agent_latent_dim > 0:
+            n_envs = observations.shape[0]
+            if training and n_envs % self._sapg_num_agents != 0:
+                raise ValueError(
+                    "SAPG requires num_train_envs to be divisible by sapg_num_agents. "
+                    f"Got n_envs={n_envs}, sapg_num_agents={self._sapg_num_agents}."
+                )
+            if training:
+                block_size = max(1, n_envs // self._sapg_num_agents)
+                agent_ids: Optional[torch.Tensor] = torch.div(
+                    torch.arange(n_envs, device=self._device), block_size, rounding_mode="floor"
+                ).clamp_(max=self._sapg_num_agents - 1)
+            else:
+                agent_ids = torch.full((n_envs,), self._sapg_leader_id, dtype=torch.long, device=self._device)
+        else:
+            agent_ids = None
+
         with torch.no_grad():
             (
                 self._cached_noise,
@@ -496,6 +597,7 @@ class FlashSACAgent(BaseAgent[FlashSACConfig]):
                 cur_count=self._cur_noise_repeat_count,
                 cur_n=self._cur_noise_repeat_n,
                 zeta_cdf=self._zeta_cdf,
+                agent_ids=agent_ids,
             )
 
         return actions.cpu().numpy()
@@ -517,7 +619,16 @@ class FlashSACAgent(BaseAgent[FlashSACConfig]):
         return self._replay_buffer.can_sample()
 
     def update(self) -> dict[str, Any]:
-        batch = cast(dict[str, torch.Tensor], self._replay_buffer.sample())
+        if self._cfg.sapg_enabled:
+            batch = cast(
+                dict[str, torch.Tensor],
+                self._replay_buffer.sample_sapg(
+                    leader_id=self._sapg_leader_id,
+                    off_policy_ratio=self._cfg.sapg_off_policy_ratio,
+                ),
+            )
+        else:
+            batch = cast(dict[str, torch.Tensor], self._replay_buffer.sample())
 
         for k, v in batch.items():
             batch[k] = v.to(self._device, non_blocking=True)
@@ -545,6 +656,7 @@ class FlashSACAgent(BaseAgent[FlashSACConfig]):
             do_actor_update=(self._update_step % self._cfg.actor_update_period == 0),
             device=self._device,
             grad_scaler=self._grad_scaler,
+            target_entropy_offsets=self._sapg_target_entropy_offsets,
         )
         self._update_step += 1
 
