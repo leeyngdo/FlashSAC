@@ -572,7 +572,10 @@ class FlashSACAgent(BaseAgent[FlashSACConfig]):
         if self._cfg.normalize_reward:
             assert "reward" in transition and self.reward_normalizer is not None
             self.reward_normalizer.update_reward_stats(
-                reward=torch.as_tensor(transition["reward"], device=self._device),
+                # float32 keeps the running stats from promoting to float64 when the env
+                # returns float64 rewards (e.g. gymnasium MuJoCo), which would crash the
+                # compiled categorical TD target's scatter_add_.
+                reward=torch.as_tensor(transition["reward"], dtype=torch.float32, device=self._device),
                 terminated=torch.as_tensor(transition["terminated"], device=self._device),
                 truncated=torch.as_tensor(transition["truncated"], device=self._device),
             )
