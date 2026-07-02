@@ -40,6 +40,11 @@ for seed in "${seeds[@]}"; do
             `#=== Benchmark default ===#` \
             --overrides agent.asymmetric_observation=false \
             --overrides gamma=0.99 \
-            --overrides n_step=1
+            --overrides n_step=1 \
+            `#=== Logging ===#` \
+            --overrides logger_type=wandb \
+            --overrides project_name=FlashRL-maxinforl \
+            --overrides group_name=mujoco-benchmark \
+            --overrides exp_name=maxinfosac
     done
 done

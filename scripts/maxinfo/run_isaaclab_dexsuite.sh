@@ -11,6 +11,6 @@ CUDA_VISIBLE_DEVICES=${1:-0} uv run --no-sync python train.py \
   --overrides num_env_steps=30_000_000 \
   --overrides num_eval_episodes=4096 --overrides num_record_episodes=0 \
   --overrides agent.maxinfo_enabled=true \
-  --overrides logger_type=wandb --overrides project_name=FlashRL-sapg \
-  --overrides group_name=maxinfo-gate1 \
+  --overrides logger_type=wandb --overrides project_name=FlashRL-maxinforl \
+  --overrides group_name=kuka-allegro-reorient \
   --overrides exp_name=maxinfosac --overrides seed=${2:-0}
