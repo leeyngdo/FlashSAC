@@ -6,10 +6,17 @@ from typing import Any, MutableMapping, Optional, cast
 import gymnasium as gym
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.optim as optim
 from torch.amp.grad_scaler import GradScaler
 
 from flash_rl.agents.base_agent import BaseAgent
+from flash_rl.agents.flashSAC.maxinfo import (
+    MaxInfoModules,
+    init_maxinfo,
+    update_dyn_scale,
+    update_ensemble,
+)
 from flash_rl.agents.flashSAC.network import (
     FlashSACActor,
     FlashSACDoubleCritic,
@@ -84,6 +91,18 @@ class FlashSACConfig:
 
     buffer_obs_dtype: Optional[str] = None
     buffer_optimize_memory_usage: bool = True
+
+    # MaxInfoRL (MaxInfoSAC): directed exploration via an ensemble-disagreement
+    # information-gain bonus in the actor objective and the TD target.
+    # https://arxiv.org/abs/2412.12098
+    maxinfo_enabled: bool = False
+    maxinfo_num_heads: int = 5
+    maxinfo_hidden_dim: int = 256
+    maxinfo_num_hidden_layers: int = 2
+    maxinfo_learning_rate: float = 3e-4
+    maxinfo_learn_reward: bool = True
+    maxinfo_dyn_scale_init: float = 1.0
+    maxinfo_dyn_scale_auto: bool = True
 
 
 def _init_flashsac_networks(
@@ -281,7 +300,9 @@ def _update_networks(
     do_actor_update: bool,
     device: torch.device,
     grad_scaler: Optional[GradScaler],
+    maxinfo: Optional[MaxInfoModules] = None,
 ) -> dict[str, torch.Tensor]:
+    maxinfo_scale_info: dict[str, torch.Tensor] = {}
     if do_actor_update:
         # Update actor
         actor_info = update_actor(
@@ -293,6 +314,7 @@ def _update_networks(
             device=device,
             use_amp=cfg.use_amp,
             grad_scaler=grad_scaler,
+            maxinfo=maxinfo,
         )
 
         # Update temperature
@@ -301,6 +323,21 @@ def _update_networks(
             entropy=actor_info["actor/entropy"],
             target_entropy=cast(float, cfg.temp_target_entropy),
         )
+
+        # Update the info-gain scale (beta) against the delayed policy's info gain
+        if maxinfo is not None:
+            info_gain_rows = actor_info.pop("maxinfo/info_gain_rows")
+            target_info_gain_rows = actor_info.pop("maxinfo/target_info_gain_rows")
+            actor_info["maxinfo/info_gain"] = info_gain_rows.mean()
+            actor_info["maxinfo/target_info_gain"] = target_info_gain_rows.mean()
+            if maxinfo.dyn_scale_auto:
+                maxinfo_scale_info = update_dyn_scale(
+                    dyn_scale=maxinfo.dyn_scale,
+                    info_gain_rows=info_gain_rows,
+                    target_info_gain_rows=target_info_gain_rows,
+                )
+            else:
+                maxinfo_scale_info = {"maxinfo/dyn_scale": maxinfo.dyn_scale().detach().mean()}
     else:
         actor_info = {}
         temperature_info = {}
@@ -320,11 +357,18 @@ def _update_networks(
         device=device,
         use_amp=cfg.use_amp,
         grad_scaler=grad_scaler,
+        maxinfo=maxinfo,
     )
 
     target_critic_info = update_target_network(
         target_network=target_critic,
     )
+
+    # Train the dynamics ensemble and EMA the actor target alongside the critic target
+    maxinfo_info: dict[str, torch.Tensor] = {}
+    if maxinfo is not None:
+        update_target_network(target_network=maxinfo.actor_target)
+        maxinfo_info = update_ensemble(maxinfo, batch)
 
     # Merge all info dicts
     update_info = {
@@ -332,6 +376,8 @@ def _update_networks(
         **critic_info,
         **target_critic_info,
         **temperature_info,
+        **maxinfo_scale_info,
+        **maxinfo_info,
     }
 
     return update_info
@@ -413,17 +459,35 @@ class FlashSACAgent(BaseAgent[FlashSACConfig]):
             cfg=self._cfg,
             device=self._device,
         )
+        # MaxInfoRL modules (dynamics ensemble, exploration scale, EMA actor target).
+        self._maxinfo: Optional[MaxInfoModules] = None
+        if self._cfg.maxinfo_enabled:
+            self._maxinfo = init_maxinfo(
+                actor=self._actor,
+                actor_observation_dim=self._actor_observation_dim,
+                observation_dim=self._critic_observation_dim,
+                action_dim=self._action_dim,
+                action_bias=self._action_bias,
+                action_range=self._action_range,
+                cfg=self._cfg,
+                device=self._device,
+            )
+
         # Sync initial weights from rank 0 so every data-parallel rank starts identical.
         # No-op when training in a single process.
-        broadcast_parameters_(
-            [
-                self._actor.network,
-                self._critic.network,
-                self._target_critic.network,
-                self._temperature.network,
-            ],
-            src=0,
-        )
+        broadcast_modules: list[nn.Module] = [
+            self._actor.network,
+            self._critic.network,
+            self._target_critic.network,
+            self._temperature.network,
+        ]
+        if self._maxinfo is not None:
+            broadcast_modules += [
+                self._maxinfo.ensemble.network,
+                self._maxinfo.dyn_scale.network,
+                self._maxinfo.actor_target.network,
+            ]
+        broadcast_parameters_(broadcast_modules, src=0)
         self._update_step = 0
 
         # Grad scaler for FP16 AMP
@@ -545,6 +609,7 @@ class FlashSACAgent(BaseAgent[FlashSACConfig]):
             do_actor_update=(self._update_step % self._cfg.actor_update_period == 0),
             device=self._device,
             grad_scaler=self._grad_scaler,
+            maxinfo=self._maxinfo,
         )
         self._update_step += 1
 
@@ -564,6 +629,10 @@ class FlashSACAgent(BaseAgent[FlashSACConfig]):
         self._critic.save(os.path.join(path, "critic.pt"))
         self._target_critic.save(os.path.join(path, "target_critic.pt"))
         self._temperature.save(os.path.join(path, "temperature.pt"))
+        if self._maxinfo is not None:
+            self._maxinfo.ensemble.save(os.path.join(path, "maxinfo_ensemble.pt"))
+            self._maxinfo.dyn_scale.save(os.path.join(path, "maxinfo_dyn_scale.pt"))
+            self._maxinfo.actor_target.save(os.path.join(path, "maxinfo_actor_target.pt"))
         if self.reward_normalizer is not None:
             self.reward_normalizer.save(os.path.join(path, "reward_normalizer.pt"))
 
@@ -584,6 +653,13 @@ class FlashSACAgent(BaseAgent[FlashSACConfig]):
         self._critic.load(os.path.join(path, "critic.pt"), load_optimizer=load_optimizer)
         self._target_critic.load(os.path.join(path, "target_critic.pt"), load_optimizer=False)
         self._temperature.load(os.path.join(path, "temperature.pt"), load_optimizer=load_optimizer)
+        if self._maxinfo is not None:
+            self._maxinfo.ensemble.load(os.path.join(path, "maxinfo_ensemble.pt"), load_optimizer=load_optimizer)
+            self._maxinfo.dyn_scale.load(
+                os.path.join(path, "maxinfo_dyn_scale.pt"),
+                load_optimizer=load_optimizer and self._maxinfo.dyn_scale_auto,
+            )
+            self._maxinfo.actor_target.load(os.path.join(path, "maxinfo_actor_target.pt"), load_optimizer=False)
 
         # Load agent-level optimizer state
         if load_optimizer:
