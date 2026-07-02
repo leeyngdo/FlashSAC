@@ -29,6 +29,8 @@ ACTION_BOUNDS = {
     "Isaac-Velocity-Rough-Anymal-D-v0": 1.0,
     "Isaac-Tracking-Flat-G1-v0": 1.0,
     "Isaac-Tracking-Flat-G1-WoSE-v0": 1.0,
+    "Isaac-Dexsuite-Kuka-Allegro-Reorient-v0": 1.0,  # RelativeJointPositionAction(scale=0.1)
+    "Isaac-Dexsuite-Kuka-Allegro-Lift-v0": 1.0,
 }
 
 # NOTE: Local IsaacLab tasks must be imported after AppLauncher starts IsaacSim and before parse_env_cfg.
@@ -36,6 +38,11 @@ LOCAL_ISAACLAB_TASKS: dict[str, tuple[str, Callable[..., Any] | None]] = {
     "Isaac-Tracking-Flat-G1-v0": ("flash_rl.envs.isaaclab_envs.tracking.config.g1", apply_tracking_overrides),
     "Isaac-Tracking-Flat-G1-WoSE-v0": ("flash_rl.envs.isaaclab_envs.tracking.config.g1", apply_tracking_overrides),
 }
+
+
+def concat_obs_groups(obs_dict: dict[str, torch.Tensor], group_names: list[str]) -> torch.Tensor:
+    """Concatenate manager-based observation groups into one flat tensor (fixed order)."""
+    return torch.cat([obs_dict[g] for g in group_names], dim=-1)
 
 
 def recursive_to_numpy(
@@ -85,6 +92,7 @@ class IsaacLabVectorEnv(
         motion: dict[str, Any] | None = None,
         cfg_overrides: dict[str, Any] | None = None,
         action_bound: dict[str, Any] | None = None,
+        obs_groups: list[str] | None = None,
         distributed: bool = False,
     ):
         from isaaclab.app import AppLauncher
@@ -144,21 +152,35 @@ class IsaacLabVectorEnv(
         # Get observation/action spaces
         # NOTE: Action range: [-1, 1] * action_bounds (https://github.com/google-deepmind/mujoco_playground/issues/19)
         obs_space = cast(Any, self.envs.unwrapped).single_observation_space
-        self.obs_size = obs_space["policy"].shape
-        self.asymmetric_obs = isinstance(obs_space, gym.spaces.Dict) and "critic" in obs_space.spaces
-        if self.asymmetric_obs:
+        self.obs_groups: list[str] | None = list(obs_groups) if obs_groups is not None else None
+        self.obs_size: tuple[int, ...]
+        self.critic_obs_size: Any
+        if self.obs_groups is not None:
+            # Generic multi-group concat (e.g. dexsuite's policy/proprio/perception).
+            assert isinstance(obs_space, gym.spaces.Dict), "obs_groups requires a Dict observation space"
+            missing = [g for g in self.obs_groups if g not in obs_space.spaces]
+            assert not missing, f"obs groups {missing} not in observation space {list(obs_space.spaces)}"
+            total_dim = sum(cast("tuple[int, ...]", obs_space[g].shape)[-1] for g in self.obs_groups)
+            self.obs_size = (total_dim,)
+            self.asymmetric_obs = False
+            self.critic_obs_size = 0
+            self.single_observation_space = gym.spaces.Box(low=0.0, high=0.0, shape=(total_dim,), dtype=np.float32)
+        elif isinstance(obs_space, gym.spaces.Dict) and "critic" in obs_space.spaces:
             # NOTE: Env will treat concatenate actor & critic states as the observation,
             # but will give 'actual' observation size in the info.
-            self.critic_obs_size = obs_space["critic"].shape
+            self.obs_size = cast("tuple[int, ...]", obs_space["policy"].shape)
+            self.asymmetric_obs = True
+            self.critic_obs_size = cast("tuple[int, ...]", obs_space["critic"].shape)
             # NOTE: setting to [0, 0] since we only need the shape and dtype
             self.single_observation_space = gym.spaces.Box(
                 low=0.0, high=0.0, shape=(self.obs_size[-1] + self.critic_obs_size[-1],), dtype=np.float32
             )
-            self.observation_space = batch_space(self.single_observation_space, self.num_envs)
         else:
+            self.obs_size = obs_space["policy"].shape
+            self.asymmetric_obs = False
             self.critic_obs_size = 0
             self.single_observation_space = gym.spaces.Box(low=0.0, high=0.0, shape=self.obs_size, dtype=np.float32)
-            self.observation_space = batch_space(self.single_observation_space, self.num_envs)
+        self.observation_space = batch_space(self.single_observation_space, self.num_envs)
 
         self.action_size = cast(Any, self.envs.unwrapped).single_action_space.shape
         self._action_low = torch.full(self.action_size, -float(action_bounds), device=self.device)
@@ -235,12 +257,16 @@ class IsaacLabVectorEnv(
         random_start_init: bool = True,
     ) -> tuple[Union[torch.Tensor, F32NDArray], dict[str, Any]]:
         obs_dict, infos = self.envs.reset()
-        obs = obs_dict["policy"]
-        if self.asymmetric_obs:
-            critic_obs = obs_dict["critic"]
-            obs = torch.cat((obs, critic_obs), dim=-1)
-        else:
+        if self.obs_groups is not None:
+            obs = cast(Any, concat_obs_groups(obs_dict, self.obs_groups))
             critic_obs = None
+        else:
+            obs = obs_dict["policy"]
+            if self.asymmetric_obs:
+                critic_obs = obs_dict["critic"]
+                obs = torch.cat((obs, critic_obs), dim=-1)
+            else:
+                critic_obs = None
         # NOTE: decorrelate episode horizons like RSL‑RL
         # In IsaacLab, `dones` is computed as follows:
         # `time_out = self.episode_length_buf >= self.max_episode_length - 1`
@@ -271,20 +297,27 @@ class IsaacLabVectorEnv(
 
         torch_actions = torch.clamp(torch_actions, self._action_low, self._action_high)
         obs_dict, rew, terminations, truncations, raw_infos = cast(Any, self.envs.step(torch_actions))
-        obs = obs_dict["policy"]
-        if self.asymmetric_obs:
-            critic_obs = obs_dict["critic"]
-            obs = torch.cat((obs, critic_obs), dim=-1)
-        else:
+        if self.obs_groups is not None:
+            obs = cast(Any, concat_obs_groups(obs_dict, self.obs_groups))
             critic_obs = None
+        else:
+            obs = obs_dict["policy"]
+            if self.asymmetric_obs:
+                critic_obs = obs_dict["critic"]
+                obs = torch.cat((obs, critic_obs), dim=-1)
+            else:
+                critic_obs = None
         infos = {"time_outs": truncations, "observations": {"critic": critic_obs}}
         # NOTE: There's really no way to get the raw observations from IsaacLab
         # We just use the 'reset_obs' as next_obs, unfortunately.
         # See https://github.com/isaac-sim/IsaacLab/issues/1362
         if self._final_obs_buf is not None:
-            final_obs = self._final_obs_buf["policy"]
-            if self.asymmetric_obs:
-                final_obs = torch.cat((final_obs, self._final_obs_buf["critic"]), dim=-1)
+            if self.obs_groups is not None:
+                final_obs = concat_obs_groups(self._final_obs_buf, self.obs_groups)
+            else:
+                final_obs = self._final_obs_buf["policy"]
+                if self.asymmetric_obs:
+                    final_obs = torch.cat((final_obs, self._final_obs_buf["critic"]), dim=-1)
             infos["final_obs"] = final_obs
         else:
             infos["final_obs"] = obs
@@ -327,6 +360,7 @@ def make_isaaclab_env(
     motion: dict[str, Any] | None = None,
     cfg_overrides: dict[str, Any] | None = None,
     action_bound: dict[str, Any] | None = None,
+    obs_groups: list[str] | None = None,
 ) -> IsaacLabVectorEnv:
     if env_name not in ACTION_BOUNDS:
         print(f"Action bounds not defined for {env_name}; using default value 1.0.")
@@ -352,6 +386,7 @@ def make_isaaclab_env(
         motion=motion,
         cfg_overrides=cfg_overrides,
         action_bound=action_bound,
+        obs_groups=obs_groups,
         distributed=distributed,
     )
     return env
