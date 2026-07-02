@@ -154,7 +154,10 @@ class Network:
 
             if self.scheduler is not None and ckpt.get("scheduler_state_dict") is not None:
                 self.scheduler.load_state_dict(ckpt["scheduler_state_dict"])
-            else:
+            elif self.scheduler is not None or ckpt.get("scheduler_state_dict") is not None:
+                # Warn only when scheduler state actually exists on one side; a network
+                # deliberately built without a scheduler (e.g. the maxinfo ensemble's
+                # constant-lr Adam) loses nothing here.
                 print(
                     f"[Warning] load_optimizer=True but scheduler is None or checkpoint has no scheduler state."
                     f" Skipping scheduler load for {path}."

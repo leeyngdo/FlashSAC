@@ -273,7 +273,7 @@ def test_disabled_path_has_no_maxinfo() -> None:
     assert not any(k.startswith("maxinfo/") for k in info)
 
 
-def test_save_load_roundtrip(tmp_path: Any) -> None:
+def test_save_load_roundtrip(tmp_path: Any, capsys: Any) -> None:
     agent = _make_agent()
     _fill_buffer(agent)
     agent.update()
@@ -288,3 +288,5 @@ def test_save_load_roundtrip(tmp_path: Any) -> None:
     assert torch.allclose(next(iter(agent2._maxinfo.ensemble.network.parameters())), ensemble_param)
     assert torch.allclose(agent2._maxinfo.dyn_scale.network.log_temp, log_scale)
     assert torch.allclose(agent2._maxinfo.ensemble.network.gain_normalizer.mean, gain_mean)
+    # The ensemble intentionally has no LR scheduler; loading it must not warn.
+    assert "Skipping scheduler load" not in capsys.readouterr().out
