@@ -65,9 +65,13 @@ through the `actor_entropy` argument of `_compute_categorical_td_target`
    actor path (reference behavior).
 6. **Precision**: ensemble forward, disagreement, and normalizer math run in float32
    with autocast disabled — head-variance in fp16 is precision-fragile.
-7. **Compile**: ensemble wrapped in `Network(compile_network=cfg.use_compile)`;
-   CUDA-graph outputs `.clone()`d before crossing compiled-call boundaries (existing
-   discipline in this codebase).
+7. **Compile**: ensemble, β, and actor_target wrapped in
+   `Network(compile_network=cfg.use_compile, compile_mode="default")` — inductor
+   without CUDA graphs. Letting these extra networks join the CUDA-graph pool
+   alongside the actor/critic corrupts cudagraph-trees pool accounting at high env
+   counts (reproduced at 4096 envs on dexsuite: "live storage data ptrs ... not
+   accounted for" during the actor's warmup). CUDA-graph outputs are still
+   `.clone()`d before crossing compiled-call boundaries (existing discipline).
 
 ## Assumptions (autonomous-run decisions)
 

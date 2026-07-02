@@ -168,6 +168,11 @@ def init_maxinfo(
 ) -> MaxInfoModules:
     """Build the ensemble, the exploration scale (beta), and the EMA actor target."""
     use_fused = device.type == "cuda" and torch.cuda.is_available()
+    # Compile without CUDA graphs: adding these networks to the CUDA-graph pool
+    # alongside the actor/critic graphs corrupts cudagraph-trees pool accounting at
+    # high env counts ("live storage data ptrs ... not accounted for" on the actor's
+    # warmup). Inductor kernels still apply; only graph capture is skipped.
+    compile_mode = "default"
 
     dynamics = MaxInfoDynamics(
         obs_dim=observation_dim,
@@ -182,7 +187,7 @@ def init_maxinfo(
         # Constant lr like the reference; the ensemble is a supervised regressor.
         optimizer=optim.Adam(dynamics.parameters(), lr=cfg.maxinfo_learning_rate, fused=use_fused),
         compile_network=cfg.use_compile,
-        compile_mode=cfg.compile_mode,
+        compile_mode=compile_mode,
     )
 
     dyn_scale_net = FlashSACTemperature(cfg.maxinfo_dyn_scale_init).to(device)
@@ -206,7 +211,7 @@ def init_maxinfo(
         optimizer=dyn_scale_optimizer,
         scheduler=dyn_scale_scheduler,
         compile_network=cfg.use_compile,
-        compile_mode=cfg.compile_mode,
+        compile_mode=compile_mode,
     )
 
     actor_target_net = FlashSACActor(
@@ -222,7 +227,7 @@ def init_maxinfo(
     actor_target = Network(
         network=actor_target_net,
         compile_network=cfg.use_compile,
-        compile_mode=cfg.compile_mode,
+        compile_mode=compile_mode,
         use_weight_normalization=True,
         ema_source=actor,
         ema_tau=cfg.critic_target_update_tau,
