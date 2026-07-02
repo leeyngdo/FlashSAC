@@ -71,12 +71,13 @@ through the `actor_entropy` argument of `_compute_categorical_td_target`
 
 ## Assumptions (autonomous-run decisions)
 
-- **Base commit**: `main` (`f2da589`), as requested. Of the diversity branch's update-path
-  fixes, only `d942dc7` (float32 reward-normalizer stats) is cherry-picked: without it,
-  main crashes on any float64-reward env (gymnasium MuJoCo) with `normalize_reward=true`
-  — maxinfo on or off — in the compiled categorical TD target's `scatter_add_`
-  (verified with a maxinfo-disabled dry run). The per-row entropy CUDA-graph fix is
-  diversity-only and not needed here.
+- **Base commit**: `main` (`f2da589`), as requested. Two diversity-branch commits are
+  cherry-picked: `d942dc7` (float32 reward-normalizer stats — without it main crashes
+  on any float64-reward env (gymnasium MuJoCo) with `normalize_reward=true`, maxinfo on
+  or off, in the compiled categorical TD target's `scatter_add_`; verified with a
+  maxinfo-disabled dry run) and `87af110` (obs-group concat + dexsuite tasks in the
+  IsaacLab wrapper — required to run the Kuka-Allegro dexsuite benchmark). The per-row
+  entropy CUDA-graph fix is diversity-only and not needed here.
 - **Observation for the dynamics model**: the critic (full/privileged) observation, both
   as input and as Δ target. Actor gradients flow only through actions, so asymmetric
   actor observations need no special handling.
@@ -118,9 +119,9 @@ uses a constant lr like the reference.
   orchestration, save/load, metrics (`maxinfo/ensemble_loss`, `maxinfo/dyn_scale`,
   `maxinfo/info_gain`, `maxinfo/target_info_gain`, `maxinfo/next_info_gain`).
 - `configs/agent/flashSAC.yaml`: the fields above, disabled by default.
-- `scripts/maxinfo/run_mujoco.sh`: MuJoCo benchmark runner with maxinfo enabled
-  (an IsaacLab dexsuite runner needs the diversity branch's obs-group/dexsuite env
-  support, which is not on main — deferred until that lands).
+- `scripts/maxinfo/run_mujoco.sh`, `scripts/maxinfo/run_isaaclab_dexsuite.sh`: runners
+  mirroring the existing script style with maxinfo enabled (the dexsuite runner works
+  after cherry-picking the obs-group/dexsuite wrapper support, see below).
 - `tests/unit/agents/test_maxinfo.py`.
 
 ## Testing
