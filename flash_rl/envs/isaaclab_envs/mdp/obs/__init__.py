@@ -13,6 +13,14 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
+# Dexsuite (object + hand terms)
+from .dexsuite import (
+    body_state_b,
+    fingers_contact_force_b,
+    object_point_cloud_b,
+    object_quat_b,
+)
+
 # Motion (custom tracking terms)
 from .motion import (
     motion_anchor_ori_b,
@@ -29,7 +37,9 @@ from .proprio import (
     base_ang_vel,
     base_lin_vel,
     generated_commands,
+    joint_pos,
     joint_pos_rel,
+    joint_vel,
     joint_vel_rel,
     last_action,
 )
@@ -47,7 +57,14 @@ OBS_TERMS: dict[str, Callable] = {
     "generated_commands": generated_commands,
     "base_lin_vel": base_lin_vel,
     "base_ang_vel": base_ang_vel,
+    "joint_pos": joint_pos,
     "joint_pos_rel": joint_pos_rel,
+    "joint_vel": joint_vel,
     "joint_vel_rel": joint_vel_rel,
     "last_action": last_action,
+    # Dexsuite (object + hand terms)
+    "body_state_b": body_state_b,
+    "fingers_contact_force_b": fingers_contact_force_b,
+    "object_quat_b": object_quat_b,
+    "object_point_cloud_b": object_point_cloud_b,
 }

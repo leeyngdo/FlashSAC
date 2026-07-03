@@ -10,6 +10,7 @@ from gymnasium.vector import VectorEnv
 from gymnasium.vector.utils import batch_space
 
 from ..types import F32NDArray, NDArray
+from .isaaclab_envs.dexsuite.overrides import apply_dexsuite_overrides
 from .isaaclab_envs.tracking.overrides import apply_tracking_overrides, omegaconf_to_plain
 from .isaaclab_envs.utils.action_bounds import compute_joint_limit_action_bound
 
@@ -29,12 +30,17 @@ ACTION_BOUNDS = {
     "Isaac-Velocity-Rough-Anymal-D-v0": 1.0,
     "Isaac-Tracking-Flat-G1-v0": 1.0,
     "Isaac-Tracking-Flat-G1-WoSE-v0": 1.0,
+    "Isaac-Dexsuite-Kuka-Allegro-Reorient-v0": 1.0,
 }
 
 # NOTE: Local IsaacLab tasks must be imported after AppLauncher starts IsaacSim and before parse_env_cfg.
 LOCAL_ISAACLAB_TASKS: dict[str, tuple[str, Callable[..., Any] | None]] = {
     "Isaac-Tracking-Flat-G1-v0": ("flash_rl.envs.isaaclab_envs.tracking.config.g1", apply_tracking_overrides),
     "Isaac-Tracking-Flat-G1-WoSE-v0": ("flash_rl.envs.isaaclab_envs.tracking.config.g1", apply_tracking_overrides),
+    "Isaac-Dexsuite-Kuka-Allegro-Reorient-v0": (
+        "flash_rl.envs.isaaclab_envs.dexsuite.config.kuka_allegro",
+        apply_dexsuite_overrides,
+    ),
 }
 
 
