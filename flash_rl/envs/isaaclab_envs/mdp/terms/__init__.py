@@ -10,6 +10,9 @@ from __future__ import annotations
 
 from typing import Callable
 
+# Dexsuite
+from .dexsuite import out_of_bound
+
 # Tracking
 from .tracking import (
     bad_anchor_ori,
@@ -25,6 +28,7 @@ __all__ = [
     "bad_anchor_pos_z_only",
     "bad_motion_body_pos",
     "bad_motion_body_pos_z_only",
+    "out_of_bound",
     "TERM_TERMS",
 ]
 
@@ -34,4 +38,5 @@ TERM_TERMS: dict[str, Callable] = {
     "bad_anchor_ori": bad_anchor_ori,
     "bad_motion_body_pos": bad_motion_body_pos,
     "bad_motion_body_pos_z_only": bad_motion_body_pos_z_only,
+    "out_of_bound": out_of_bound,
 }
