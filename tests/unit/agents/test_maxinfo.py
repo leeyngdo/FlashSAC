@@ -211,6 +211,22 @@ def test_dyn_scale_falls_when_gain_above_target() -> None:
     assert dyn_scale.network.log_temp.item() < 0.0
 
 
+def test_dyn_scale_clamped_on_persistent_one_sided_gap() -> None:
+    """A persistent gap must not drift beta out of [DYN_SCALE_MIN, DYN_SCALE_MAX]."""
+    from flash_rl.agents.flashSAC.maxinfo import DYN_SCALE_MAX, DYN_SCALE_MIN
+
+    for sign, bound in ((-1.0, DYN_SCALE_MAX), (1.0, DYN_SCALE_MIN)):
+        dyn_scale = _make_dyn_scale()
+        for _ in range(300):
+            update_dyn_scale(
+                dyn_scale=dyn_scale,
+                info_gain_rows=torch.full((8,), sign),
+                target_info_gain_rows=torch.full((8,), -sign),
+            )
+        beta = dyn_scale.network.log_temp.exp().item()
+        assert abs(beta - bound) / bound < 1e-3, f"beta={beta} escaped bound={bound}"
+
+
 # ---------------------------------------------------------------------------
 # FlashSACAgent integration
 # ---------------------------------------------------------------------------

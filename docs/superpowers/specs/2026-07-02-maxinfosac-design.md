@@ -54,7 +54,11 @@ through the `actor_entropy` argument of `_compute_categorical_td_target`
    module; new `update_dyn_scale` mirrors `update_temperature`'s value-form loss
    `β·(g_rows − g_target_rows).mean()` (FlashSAC's temperature idiom; the reference uses
    the log-form — same fixed point and sign, different step scaling). Updated only on
-   actor steps, like temperature.
+   actor steps, like temperature. log β is clamped to `[DYN_SCALE_MIN, DYN_SCALE_MAX]`
+   = [1e-2, 10] after each step: the tuner is a pure integrator on `E[g − g_target]`,
+   and at the 10G-step scale a persistent ε-bias in the gap drifted β to 0 (500M run,
+   pre-normalization-fix) and past 1e7 (1024-env run, post-fix) — the unguarded
+   reference never integrates long enough to expose this.
 4. **actor_target**: `Network` EMA copy of the actor (`ema_source=actor`,
    `ema_tau=critic_target_update_tau` — the reference polyaks actor_target and
    critic_target with one shared tau, so the coupling, not SB3's absolute 0.005, is

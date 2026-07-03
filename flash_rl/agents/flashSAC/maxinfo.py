@@ -25,6 +25,14 @@ if TYPE_CHECKING:
 
 EPS = 1e-6
 
+# The beta auto-tuner is a pure integrator on E[g - g_target]; any persistent tiny bias
+# in that gap drifts log-beta without bound (observed in BOTH directions at the
+# 10G-step scale: collapse to 0 and explosion past 1e7, dragging the actor loss and TD
+# targets with it). The reference has no guard — its 1M-step runs never integrate long
+# enough to expose this. Clamp keeps the bonus bounded in a usable range.
+DYN_SCALE_MIN = 1e-2
+DYN_SCALE_MAX = 10.0
+
 
 class RunningNormalizer(nn.Module):
     """Streaming per-dimension mean/std (population) with in-place buffer updates.
@@ -320,5 +328,9 @@ def update_dyn_scale(
     dyn_scale.optimizer.step()
     if dyn_scale.scheduler is not None:
         dyn_scale.scheduler.step()
+
+    with torch.no_grad():
+        log_temp = cast(FlashSACTemperature, dyn_scale.network).log_temp
+        log_temp.clamp_(math.log(DYN_SCALE_MIN), math.log(DYN_SCALE_MAX))
 
     return {"maxinfo/dyn_scale": value.mean(), "maxinfo/dyn_scale_loss": loss}
