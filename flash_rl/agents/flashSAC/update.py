@@ -129,11 +129,17 @@ def update_actor(
         maxinfo_rows: dict[str, torch.Tensor] = {}
         if maxinfo is not None:
             with torch.no_grad():
-                target_actions, _ = maxinfo.actor_target(
-                    observations=batch["actor_observation"],
+                # Evaluate the delayed policy on the SAME 2B-row batch as the live actor
+                # so both share identical UnitBatchNorm batch statistics; otherwise the
+                # normalization-context mismatch adds a constant, learning-independent
+                # offset to (info_gain - target_info_gain) that collapses the auto-tuned
+                # dyn scale (the target then differs by EMA-stale parameters only,
+                # matching the reference's norm-free actor_target semantics).
+                target_actions_all, _ = maxinfo.actor_target(
+                    observations=actor_obs_all,
                     training=True,
                 )
-                target_actions = target_actions.clone()
+                target_actions = torch.chunk(target_actions_all.clone(), 2, dim=0)[0]
             # Info gain of the current and the delayed policy at the batch states; the
             # ensemble is frozen so the gradient reaches only the sampled actions.
             maxinfo.ensemble.network.requires_grad_(False)

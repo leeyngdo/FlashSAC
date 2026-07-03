@@ -103,6 +103,7 @@ class FlashSACConfig:
     maxinfo_learn_reward: bool = True
     maxinfo_dyn_scale_init: float = 1.0
     maxinfo_dyn_scale_auto: bool = True
+    maxinfo_actor_target_tau: float = 0.005
 
 
 def _init_flashsac_networks(
@@ -338,6 +339,9 @@ def _update_networks(
                 )
             else:
                 maxinfo_scale_info = {"maxinfo/dyn_scale": maxinfo.dyn_scale().detach().mean()}
+            # EMA the delayed policy once per actor update (reference cadence); doing it
+            # every update step doubles the effective tau.
+            update_target_network(target_network=maxinfo.actor_target)
     else:
         actor_info = {}
         temperature_info = {}
@@ -364,10 +368,9 @@ def _update_networks(
         target_network=target_critic,
     )
 
-    # Train the dynamics ensemble and EMA the actor target alongside the critic target
+    # Train the dynamics ensemble alongside the critic target update
     maxinfo_info: dict[str, torch.Tensor] = {}
     if maxinfo is not None:
-        update_target_network(target_network=maxinfo.actor_target)
         maxinfo_info = update_ensemble(maxinfo, batch)
 
     # Merge all info dicts
