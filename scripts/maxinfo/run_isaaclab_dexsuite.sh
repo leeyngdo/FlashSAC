@@ -9,7 +9,7 @@ CUDA_VISIBLE_DEVICES=${1:-0} uv run --no-sync python train.py \
   --overrides seed=${2:-0} \
   --overrides logger_type=wandb \
   --overrides project_name=FlashRL-maxinforl \
-  --overrides group_name=kuka-allegro-reorient \
+  --overrides group_name=kuka-allegro-reorient-tuned \
   --overrides exp_name=maxinfosac \
   `#=== Environment (GPU sim) ===#` \
   --overrides env=isaaclab_dexsuite \
