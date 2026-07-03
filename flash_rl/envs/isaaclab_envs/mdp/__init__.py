@@ -16,12 +16,12 @@ shadowing the builtins they depend on.
 from isaaclab.envs.mdp import *  # noqa: F401, F403
 
 from .cmds import *  # noqa: F401, F403
-from .obs import *  # noqa: F401, F403
-from .rews import *  # noqa: F401, F403
-from .terms import *  # noqa: F401, F403
 from .events import *  # noqa: F401, F403
+from .obs import *  # noqa: F401, F403
 
 # Registries exposed for the override layer.
 from .obs import OBS_TERMS  # noqa: F401
+from .rews import *  # noqa: F401, F403
 from .rews import REW_TERMS  # noqa: F401
+from .terms import *  # noqa: F401, F403
 from .terms import TERM_TERMS  # noqa: F401

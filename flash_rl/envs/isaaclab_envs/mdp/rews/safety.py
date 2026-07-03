@@ -7,9 +7,9 @@ the local reward registry.
 
 from __future__ import annotations
 
-import torch
 from typing import TYPE_CHECKING
 
+import torch
 from isaaclab.envs.mdp import undesired_contacts
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.sensors import ContactSensor

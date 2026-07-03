@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-import torch
 from collections.abc import Sequence
 
+import torch
 from isaaclab.actuators import ImplicitActuator, ImplicitActuatorCfg
 from isaaclab.utils import DelayBuffer, configclass
 from isaaclab.utils.types import ArticulationActions

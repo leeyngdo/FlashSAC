@@ -6,10 +6,10 @@ the robot's joint default positions and rigid-body center of mass.
 
 from __future__ import annotations
 
-import torch
 from typing import TYPE_CHECKING, Literal
 
 import isaaclab.utils.math as math_utils
+import torch
 from isaaclab.assets import Articulation
 from isaaclab.envs.mdp.events import _randomize_prop_by_op
 from isaaclab.managers import SceneEntityCfg
