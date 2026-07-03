@@ -56,14 +56,14 @@ through the `actor_entropy` argument of `_compute_categorical_td_target`
    the log-form — same fixed point and sign, different step scaling). Updated only on
    actor steps, like temperature.
 4. **actor_target**: `Network` EMA copy of the actor (`ema_source=actor`,
-   `ema_tau=maxinfo_actor_target_tau`, default 0.005 = the reference's SB3 tau), EMA'd
-   once per **actor update** (reference cadence). Called with `training=True` **on the
-   same concatenated 2B-row batch as the live actor** so both policies share identical
-   UnitBatchNorm batch statistics and differ by EMA-stale parameters only. (A 500M-step
-   audit showed that evaluating the target on its own B-row batch adds a constant
-   normalization-context offset to `g − g_target`, and coupling to the critic tau with
-   per-update EMA made the target ~4x less stale than the reference — together these
-   collapsed the auto-tuned β to 0 by ~150M steps.)
+   `ema_tau=critic_target_update_tau`), EMA'd every update step alongside the target
+   critic — the reference polyaks actor_target and critic_target together with one
+   shared tau, so the coupling (not SB3's absolute 0.005) is what we preserve. Called
+   with `training=True` **on the same concatenated 2B-row batch as the live actor** so
+   both policies share identical UnitBatchNorm batch statistics and differ by EMA-stale
+   parameters only. (A 500M-step audit showed that evaluating the target on its own
+   B-row batch adds a constant, learning-independent normalization-context offset to
+   `g − g_target`, which collapsed the auto-tuned β to 0 by ~150M steps.)
 5. **Ensemble step**: one MSE gradient step per `agent.update()` on the sampled batch,
    after actor/critic updates (reference order). Input/output normalizers update from
    the batch at the start of `update()`; the info-gain normalizer updates only in the
@@ -109,14 +109,14 @@ maxinfo_enabled: false          # master switch
 maxinfo_num_heads: 5            # ensemble size E
 maxinfo_hidden_dim: 256         # ensemble MLP width
 maxinfo_num_hidden_layers: 2    # reference features=(256, 256)
-maxinfo_learning_rate: 3e-4     # constant Adam lr for the ensemble
 maxinfo_learn_reward: true      # include reward head in ensemble targets
 maxinfo_dyn_scale_init: 1.0     # β initial value
 maxinfo_dyn_scale_auto: true    # false → β fixed at init value
 ```
 
-β and the ensemble both use a constant-lr Adam (`maxinfo_learning_rate`), matching the
-reference's dyn-scale and ensemble optimizers.
+β and the ensemble follow the agent-wide warmup-cosine lr schedule like every other
+optimizer in this codebase (deliberate deviation: the reference uses constant lrs; we
+keep all modules' adaptation speeds in proportion).
 
 ## Files
 

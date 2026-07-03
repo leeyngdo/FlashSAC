@@ -62,8 +62,6 @@ maxinfo_enabled: false
 maxinfo_num_heads: 5
 maxinfo_hidden_dim: 256
 maxinfo_num_hidden_layers: 2
-maxinfo_learning_rate: 3e-4
 maxinfo_learn_reward: true
 maxinfo_dyn_scale_init: 1.0
 maxinfo_dyn_scale_auto: true
-maxinfo_actor_target_tau: 0.005

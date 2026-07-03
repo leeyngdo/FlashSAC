@@ -17,6 +17,7 @@ import torch.optim as optim
 
 from flash_rl.agents.flashSAC.network import FlashSACActor, FlashSACTemperature
 from flash_rl.agents.utils.network import Network
+from flash_rl.agents.utils.scheduler import warmup_cosine_decay_scheduler
 from flash_rl.common.distributed import all_reduce_grads_average_
 
 if TYPE_CHECKING:
@@ -167,6 +168,22 @@ def init_maxinfo(
 ) -> MaxInfoModules:
     """Build the ensemble, the exploration scale (beta), and the EMA actor target."""
     use_fused = device.type == "cuda" and torch.cuda.is_available()
+    # All maxinfo modules follow the agent-wide warmup-cosine lr schedule, like every
+    # other optimizer in this codebase (the reference uses constant lrs instead).
+    warmup_cosine_decay_lr = warmup_cosine_decay_scheduler(
+        init_value=cfg.learning_rate_init,
+        peak_value=cfg.learning_rate_peak,
+        end_value=cfg.learning_rate_end,
+        warmup_steps=cfg.learning_rate_warmup_step,
+        decay_steps=cfg.learning_rate_decay_step,
+    )
+
+    def _make_scheduler(optimizer: optim.Optimizer) -> torch.optim.lr_scheduler.LRScheduler:
+        return torch.optim.lr_scheduler.LambdaLR(
+            optimizer,
+            lr_lambda=lambda step: warmup_cosine_decay_lr(step) / cfg.learning_rate_peak,
+        )
+
     # Compile without CUDA graphs: adding these networks to the CUDA-graph pool
     # alongside the actor/critic graphs corrupts cudagraph-trees pool accounting at
     # high env counts ("live storage data ptrs ... not accounted for" on the actor's
@@ -181,22 +198,25 @@ def init_maxinfo(
         num_hidden_layers=cfg.maxinfo_num_hidden_layers,
         learn_reward=cfg.maxinfo_learn_reward,
     ).to(device)
+    ensemble_optimizer = optim.Adam(dynamics.parameters(), lr=cfg.learning_rate_peak, fused=use_fused)
     ensemble = Network(
         network=dynamics,
-        # Constant lr like the reference; the ensemble is a supervised regressor.
-        optimizer=optim.Adam(dynamics.parameters(), lr=cfg.maxinfo_learning_rate, fused=use_fused),
+        optimizer=ensemble_optimizer,
+        scheduler=_make_scheduler(ensemble_optimizer),
         compile_network=cfg.use_compile,
         compile_mode=compile_mode,
     )
 
     dyn_scale_net = FlashSACTemperature(cfg.maxinfo_dyn_scale_init).to(device)
     dyn_scale_optimizer: Optional[optim.Adam] = None
+    dyn_scale_scheduler: Optional[torch.optim.lr_scheduler.LRScheduler] = None
     if cfg.maxinfo_dyn_scale_auto:
-        # Constant lr like the reference's dyn-scale optimizer (SB3 lr_schedule(1)).
-        dyn_scale_optimizer = optim.Adam(dyn_scale_net.parameters(), lr=cfg.maxinfo_learning_rate, fused=use_fused)
+        dyn_scale_optimizer = optim.Adam(dyn_scale_net.parameters(), lr=cfg.learning_rate_peak, fused=use_fused)
+        dyn_scale_scheduler = _make_scheduler(dyn_scale_optimizer)
     dyn_scale = Network(
         network=dyn_scale_net,
         optimizer=dyn_scale_optimizer,
+        scheduler=dyn_scale_scheduler,
         compile_network=cfg.use_compile,
         compile_mode=compile_mode,
     )
@@ -217,10 +237,9 @@ def init_maxinfo(
         compile_mode=compile_mode,
         use_weight_normalization=True,
         ema_source=actor,
-        # Own tau, decoupled from the critic's: with critic_target_update_tau and an
-        # EMA every update step the target tracked the actor ~4x faster than the
-        # reference (tau 0.005 per actor update), degenerating the beta signal.
-        ema_tau=cfg.maxinfo_actor_target_tau,
+        # Same tau as the critic target: the reference polyaks actor_target and
+        # critic_target together with one shared tau.
+        ema_tau=cfg.critic_target_update_tau,
     )
 
     return MaxInfoModules(
@@ -274,6 +293,8 @@ def update_ensemble(maxinfo: MaxInfoModules, batch: dict[str, torch.Tensor]) -> 
     loss.backward()  # type: ignore
     all_reduce_grads_average_(maxinfo.ensemble.optimizer)
     maxinfo.ensemble.optimizer.step()
+    if maxinfo.ensemble.scheduler is not None:
+        maxinfo.ensemble.scheduler.step()
 
     return {"maxinfo/ensemble_loss": loss}
 
