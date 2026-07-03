@@ -56,14 +56,17 @@ through the `actor_entropy` argument of `_compute_categorical_td_target`
    the log-form — same fixed point and sign, different step scaling). Updated only on
    actor steps, like temperature.
 4. **actor_target**: `Network` EMA copy of the actor (`ema_source=actor`,
-   `ema_tau=critic_target_update_tau`), EMA'd every update step alongside the target
-   critic — the reference polyaks actor_target and critic_target together with one
-   shared tau, so the coupling (not SB3's absolute 0.005) is what we preserve. Called
-   with `training=True` **on the same concatenated 2B-row batch as the live actor** so
-   both policies share identical UnitBatchNorm batch statistics and differ by EMA-stale
-   parameters only. (A 500M-step audit showed that evaluating the target on its own
-   B-row batch adds a constant, learning-independent normalization-context offset to
-   `g − g_target`, which collapsed the auto-tuned β to 0 by ~150M steps.)
+   `ema_tau=critic_target_update_tau` — the reference polyaks actor_target and
+   critic_target with one shared tau, so the coupling, not SB3's absolute 0.005, is
+   what we preserve), EMA'd **once per actor update**: the reference polyaks once per
+   gradient step where every step is an actor step, so the faithful mapping under
+   `actor_update_period > 1` is "tau per actor change" (EMAing every update would chase
+   a frozen actor and double the effective tau). Called with `training=True` **on the
+   same concatenated 2B-row batch as the live actor** so both policies share identical
+   UnitBatchNorm batch statistics and differ by EMA-stale parameters only. (A 500M-step
+   audit showed that evaluating the target on its own B-row batch adds a constant,
+   learning-independent normalization-context offset to `g − g_target`, which collapsed
+   the auto-tuned β to 0 by ~150M steps.)
 5. **Ensemble step**: one MSE gradient step per `agent.update()` on the sampled batch,
    after actor/critic updates (reference order). Input/output normalizers update from
    the batch at the start of `update()`; the info-gain normalizer updates only in the

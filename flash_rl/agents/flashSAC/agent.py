@@ -337,6 +337,10 @@ def _update_networks(
                 )
             else:
                 maxinfo_scale_info = {"maxinfo/dyn_scale": maxinfo.dyn_scale().detach().mean()}
+            # EMA the delayed policy once per actor CHANGE (the reference polyaks once
+            # per gradient step, where every step is an actor step); running it every
+            # update would chase a frozen actor and double the effective tau.
+            update_target_network(target_network=maxinfo.actor_target)
     else:
         actor_info = {}
         temperature_info = {}
@@ -363,10 +367,9 @@ def _update_networks(
         target_network=target_critic,
     )
 
-    # Train the dynamics ensemble and EMA the actor target alongside the critic target
+    # Train the dynamics ensemble alongside the critic target update
     maxinfo_info: dict[str, torch.Tensor] = {}
     if maxinfo is not None:
-        update_target_network(target_network=maxinfo.actor_target)
         maxinfo_info = update_ensemble(maxinfo, batch)
 
     # Merge all info dicts
