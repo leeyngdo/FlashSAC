@@ -18,8 +18,6 @@ from .isaaclab_envs.utils.action_bounds import compute_joint_limit_action_bound
 ACTION_BOUNDS = {
     "Isaac-Repose-Cube-Shadow-Direct-v0": 1.0,
     "Isaac-Repose-Cube-Allegro-Direct-v0": 1.0,
-    "Isaac-Dexsuite-Kuka-Allegro-Reorient-v0": 1.0,
-    "Isaac-Dexsuite-Kuka-Allegro-Reorient-State-v0": 1.0,
     "Isaac-Dexsuite-Kuka-Allegro-Lift-v0": 1.0,
     "Isaac-Velocity-Flat-G1-v0": 1.0,
     "Isaac-Velocity-Rough-G1-v0": 1.0,
