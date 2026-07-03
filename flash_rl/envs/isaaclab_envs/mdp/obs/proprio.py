@@ -13,7 +13,9 @@ from isaaclab.envs.mdp import (
     base_ang_vel,
     base_lin_vel,
     generated_commands,
+    joint_pos,
     joint_pos_rel,
+    joint_vel,
     joint_vel_rel,
     last_action,
 )
@@ -22,7 +24,9 @@ __all__ = [
     "base_ang_vel",
     "base_lin_vel",
     "generated_commands",
+    "joint_pos",
     "joint_pos_rel",
+    "joint_vel",
     "joint_vel_rel",
     "last_action",
 ]
