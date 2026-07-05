@@ -51,14 +51,14 @@ through the `actor_entropy` argument of `_compute_categorical_td_target`
    categorical target then adds the info-gain bonus. Targets remain clamped to
    `[min_v, max_v]` as before.
 3. **β (dyn scale)**: reuse `FlashSACTemperature` (a log-parameter scalar) as the β
-   module; new `update_dyn_scale` mirrors `update_temperature`'s value-form loss
-   `β·(g_rows − g_target_rows).mean()` (FlashSAC's temperature idiom; the reference uses
-   the log-form — same fixed point and sign, different step scaling). Updated only on
-   actor steps, like temperature. log β is clamped to `[DYN_SCALE_MIN, DYN_SCALE_MAX]`
-   = [1e-2, 10] after each step: the tuner is a pure integrator on `E[g − g_target]`,
-   and at the 10G-step scale a persistent ε-bias in the gap drifted β to 0 (500M run,
-   pre-normalization-fix) and past 1e7 (1024-env run, post-fix) — the unguarded
-   reference never integrates long enough to expose this.
+   module; new `update_dyn_scale` uses the reference log-space loss
+   `log β·(g_rows − g_target_rows).mean()`. Updated only on
+   actor steps, like temperature. log β is unclamped, as in the reference. An earlier
+   `[1e-2, 10]` clamp guarded against integrator drift (β→0 in a 500M run
+   pre-normalization-fix; β past 1e7 in a 1024-env run before the reference z-score
+   gain normalizer was restored); it was removed on the hypothesis that the restored
+   z-score + ε-prior running stats eliminate that bias — watch `maxinfo/dyn_scale`
+   in W&B when scaling up.
 4. **actor_target**: `Network` EMA copy of the actor (`ema_source=actor`,
    `ema_tau=critic_target_update_tau` — the reference polyaks actor_target and
    critic_target with one shared tau, so the coupling, not SB3's absolute 0.005, is

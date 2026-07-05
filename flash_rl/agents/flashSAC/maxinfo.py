@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional, cast
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
@@ -25,44 +26,44 @@ if TYPE_CHECKING:
 
 EPS = 1e-6
 
-# The beta auto-tuner is a pure integrator on E[g - g_target]; any persistent tiny bias
-# in that gap drifts log-beta without bound (observed in BOTH directions at the
-# 10G-step scale: collapse to 0 and explosion past 1e7, dragging the actor loss and TD
-# targets with it). The reference has no guard — its 1M-step runs never integrate long
-# enough to expose this. Clamp keeps the bonus bounded in a usable range.
-DYN_SCALE_MIN = 1e-2
-DYN_SCALE_MAX = 10.0
-
 
 class RunningNormalizer(nn.Module):
     """Streaming per-dimension mean/std (population) with in-place buffer updates.
 
-    Buffers are updated with copy_ so their addresses stay stable for CUDA-graph
-    replays that read them. Stats are per-rank (not synchronized across data-parallel
-    ranks), matching how batch-norm running stats are treated in this codebase.
+    The small prior count mirrors the RND running-stat normalizer and prevents the
+    first near-constant batch from collapsing std to EPS. Buffers are updated with
+    copy_ so their addresses stay stable for CUDA-graph replays that read them.
     """
 
     mean: torch.Tensor
     std: torch.Tensor
     count: torch.Tensor
 
-    def __init__(self, dim: int):
+    def __init__(self, dim: int, epsilon: float = 1e-4):
         super().__init__()
+        self.epsilon = epsilon
         self.register_buffer("mean", torch.zeros(dim))
         self.register_buffer("std", torch.ones(dim))
-        self.register_buffer("count", torch.zeros(()))
+        self.register_buffer("count", torch.tensor(float(epsilon)))
 
     @torch.no_grad()
     def update(self, x: torch.Tensor) -> None:
         x = x.detach().float()
-        batch_count = x.shape[0]
+        batch_count = torch.tensor(float(x.shape[0]), dtype=x.dtype, device=x.device)
+        batch_sum = x.sum(dim=0)
+        batch_sumsq = x.square().sum(dim=0)
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(batch_count, op=dist.ReduceOp.SUM)
+            dist.all_reduce(batch_sum, op=dist.ReduceOp.SUM)
+            dist.all_reduce(batch_sumsq, op=dist.ReduceOp.SUM)
+
+        batch_mean = batch_sum / batch_count
+        batch_var = torch.clamp(batch_sumsq / batch_count - batch_mean.square(), min=0.0)
         total = self.count + batch_count
-        new_mean = (self.mean * self.count + x.sum(dim=0)) / total
-        # Chan et al. parallel-merge of the sum of squared deviations.
+        delta = batch_mean - self.mean
+        new_mean = self.mean + delta * batch_count / total
         s_n = (
-            self.std.square() * self.count
-            + (x - new_mean).square().sum(dim=0)
-            + self.count * (self.mean - new_mean).square()
+            self.std.square() * self.count + batch_var * batch_count + delta.square() * self.count * batch_count / total
         )
         self.mean.copy_(new_mean)
         self.std.copy_(torch.clamp(torch.sqrt(s_n / total), min=EPS))
@@ -148,8 +149,12 @@ class MaxInfoDynamics(nn.Module):
         return self._split_mean(squared_error).mean()
 
     def info_gain(self, preds: torch.Tensor) -> torch.Tensor:
-        """Unnormalized information gain rows (B,) from head disagreement."""
-        epistemic_var = preds.std(dim=0).square()  # sample variance over heads, as in the reference
+        """Unnormalized information-gain rows (B,) from head disagreement.
+
+        Matches the reference MaxInfoSAC learn_std=False/use_entropy=True path:
+        mean(log(EPS + Var_heads(pred))) - log(EPS), aggregated over output keys.
+        """
+        epistemic_var = preds.std(dim=0).square()
         log_var = torch.log(EPS + epistemic_var)
         return self._split_mean(log_var) - math.log(EPS)
 
@@ -266,9 +271,10 @@ def policy_info_gain(
 ) -> torch.Tensor:
     """Normalized info-gain rows g(s, a) of shape (batch,), computed in float32.
 
-    Gradients flow through `actions` into the (caller-frozen) ensemble; the running
-    gain stats act as constants. Autocast is disabled because head variance is
-    precision-fragile in fp16.
+    Reference-style normalization: update a running mean/std over the current-policy
+    and EMA-policy batch gains, then z-score the rows. Gradients flow through `actions`
+    into the (caller-frozen) ensemble; the running stats act as constants. Autocast is
+    disabled because head variance is precision-fragile in fp16.
     """
     # The compiled wrapper proxies attribute access to the original module.
     model = cast(MaxInfoDynamics, maxinfo.ensemble.network)
@@ -276,7 +282,7 @@ def policy_info_gain(
         inp = torch.cat([observations.float(), actions.float()], dim=-1)
         gain = model.info_gain(maxinfo.ensemble(inp))
         if update_stats:
-            model.gain_normalizer.update(gain.unsqueeze(-1))
+            model.gain_normalizer.update(gain.detach().unsqueeze(-1))
         return model.gain_normalizer.normalize(gain.unsqueeze(-1)).squeeze(-1)
 
 
@@ -314,23 +320,19 @@ def update_dyn_scale(
 ) -> dict[str, torch.Tensor]:
     """Auto-tune the exploration scale beta against the delayed policy's info gain.
 
-    Same fixed point and sign as the reference's log-space loss, expressed in the
-    value form used by this codebase's temperature update: beta falls when the
-    current policy already gains more information than the EMA target policy.
+    Matches the reference log-space loss: beta falls when the current policy already
+    gains more information than the EMA target policy.
     """
-    value = dyn_scale().clone()
-    loss = (value * (info_gain_rows.detach() - target_info_gain_rows.detach())).mean()
+    value = dyn_scale().detach().clone()
+    log_scale = cast(FlashSACTemperature, dyn_scale.network).log_temp
+    loss = (log_scale * (info_gain_rows.detach() - target_info_gain_rows.detach())).mean()
 
     assert dyn_scale.optimizer is not None
     dyn_scale.optimizer.zero_grad(set_to_none=True)
-    loss.backward()
+    loss.backward()  # type: ignore[no-untyped-call]
     all_reduce_grads_average_(dyn_scale.optimizer)
     dyn_scale.optimizer.step()
     if dyn_scale.scheduler is not None:
         dyn_scale.scheduler.step()
-
-    with torch.no_grad():
-        log_temp = cast(FlashSACTemperature, dyn_scale.network).log_temp
-        log_temp.clamp_(math.log(DYN_SCALE_MIN), math.log(DYN_SCALE_MAX))
 
     return {"maxinfo/dyn_scale": value.mean(), "maxinfo/dyn_scale_loss": loss}

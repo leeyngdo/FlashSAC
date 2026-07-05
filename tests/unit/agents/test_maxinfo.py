@@ -1,5 +1,6 @@
 """Tests for the MaxInfoRL (MaxInfoSAC) modules and their FlashSAC integration."""
 
+import math
 from typing import Any
 
 import gymnasium as gym
@@ -8,8 +9,11 @@ import torch
 
 from flash_rl.agents.flashSAC.agent import FlashSACAgent, FlashSACConfig
 from flash_rl.agents.flashSAC.maxinfo import (
+    EPS,
     MaxInfoDynamics,
+    MaxInfoModules,
     RunningNormalizer,
+    policy_info_gain,
     update_dyn_scale,
 )
 from flash_rl.agents.flashSAC.network import FlashSACTemperature
@@ -112,6 +116,15 @@ def test_running_normalizer_identity_before_update() -> None:
     assert torch.allclose(normalizer.normalize(x), x)
 
 
+def test_running_normalizer_constant_warmup_does_not_collapse_scale() -> None:
+    normalizer = RunningNormalizer(1)
+    normalizer.update(torch.full((2048, 1), 100.0))
+
+    normalized = normalizer.normalize(torch.full((2048, 1), 100.001))
+
+    assert normalized.abs().max() < 1.0
+
+
 # ---------------------------------------------------------------------------
 # Ensemble dynamics model
 # ---------------------------------------------------------------------------
@@ -173,9 +186,42 @@ def test_disagreement_higher_off_distribution() -> None:
         loss = model.regression_loss(model(x), target)
         loss.backward()
         optimizer.step()
-    in_dist = model.info_gain(model(x)).mean()
-    off_dist = model.info_gain(model(x + 10.0)).mean()
-    assert off_dist > in_dist
+    in_dist = model.info_gain(model(x))
+    off_dist = model.info_gain(model(x + 10.0))
+    assert off_dist.mean() > in_dist.mean()
+    # Reference log-variance gain is shifted by -log(EPS), so zero disagreement maps to 0.
+    assert (in_dist >= 0).all() and (off_dist >= 0).all()
+
+
+def test_info_gain_matches_reference_log_variance_formula() -> None:
+    model = _make_dynamics(learn_reward=False)
+    preds = torch.randn(3, 5, OBS_DIM)
+    epistemic_var = preds.std(dim=0).square()
+    expected = torch.log(EPS + epistemic_var).mean(dim=-1) - math.log(EPS)
+    assert torch.allclose(model.info_gain(preds), expected)
+
+    identical_heads = torch.ones(3, 5, OBS_DIM)
+    assert torch.allclose(model.info_gain(identical_heads), torch.zeros(5))
+
+
+def test_policy_info_gain_uses_running_zscore() -> None:
+    torch.manual_seed(0)
+    model = _make_dynamics(learn_reward=False)
+    modules = MaxInfoModules(
+        ensemble=Network(network=model),
+        dyn_scale=_make_dyn_scale(),
+        actor_target=Network(network=torch.nn.Identity()),
+        dyn_scale_auto=False,
+    )
+    observations = torch.randn(8, OBS_DIM)
+    actions = torch.randn(8, ACT_DIM)
+    raw = model.info_gain(model(torch.cat([observations, actions], dim=-1)))
+
+    model.gain_normalizer.mean.fill_(1.25)
+    model.gain_normalizer.std.fill_(2.5)
+    normalized = policy_info_gain(modules, observations, actions, update_stats=False)
+
+    assert torch.allclose(normalized, (raw - 1.25) / 2.5)
 
 
 # ---------------------------------------------------------------------------
@@ -211,22 +257,6 @@ def test_dyn_scale_falls_when_gain_above_target() -> None:
     assert dyn_scale.network.log_temp.item() < 0.0
 
 
-def test_dyn_scale_clamped_on_persistent_one_sided_gap() -> None:
-    """A persistent gap must not drift beta out of [DYN_SCALE_MIN, DYN_SCALE_MAX]."""
-    from flash_rl.agents.flashSAC.maxinfo import DYN_SCALE_MAX, DYN_SCALE_MIN
-
-    for sign, bound in ((-1.0, DYN_SCALE_MAX), (1.0, DYN_SCALE_MIN)):
-        dyn_scale = _make_dyn_scale()
-        for _ in range(300):
-            update_dyn_scale(
-                dyn_scale=dyn_scale,
-                info_gain_rows=torch.full((8,), sign),
-                target_info_gain_rows=torch.full((8,), -sign),
-            )
-        beta = dyn_scale.network.log_temp.exp().item()
-        assert abs(beta - bound) / bound < 1e-3, f"beta={beta} escaped bound={bound}"
-
-
 # ---------------------------------------------------------------------------
 # FlashSACAgent integration
 # ---------------------------------------------------------------------------
@@ -249,6 +279,9 @@ def test_agent_update_emits_maxinfo_metrics() -> None:
         assert np.isfinite(info[key]), f"non-finite {key}"
     assert "actor/loss" in info
     assert np.isfinite(info["actor/loss"])
+    # Batch z-score normalization must not blow up at warmup.
+    assert abs(info["maxinfo/info_gain"]) < 1e3
+    assert abs(info["maxinfo/next_info_gain"]) < 1e3
 
 
 def _flat_params(net: torch.nn.Module) -> torch.Tensor:
