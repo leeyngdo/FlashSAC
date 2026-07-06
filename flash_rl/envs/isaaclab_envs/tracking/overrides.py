@@ -19,6 +19,10 @@ def _set_by_path(obj: Any, dotted: str, value: Any) -> None:
     if isinstance(cur, dict):
         cur[last] = value
     else:
+        # A typo'd field name would silently create a dead attribute; require the
+        # leaf to exist (dict leaves may add new keys).
+        if not hasattr(cur, last):
+            raise AttributeError(f"Unknown config attribute '{dotted}' in cfg_overrides.")
         setattr(cur, last, value)
 
 
