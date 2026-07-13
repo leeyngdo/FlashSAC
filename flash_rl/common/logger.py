@@ -32,6 +32,7 @@ class WandbTrainerLogger:
             project=cfg.project_name,
             entity=cfg.entity_name,
             group=cfg.group_name,
+            name=f"{cfg.exp_name}-seed{cfg.seed}",
             config=dict_cfg,  # type: ignore
         )
         self.media_dict: dict[str, Any] = {}

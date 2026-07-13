@@ -3,6 +3,11 @@ from typing import Any, Optional
 import torch
 from torch.amp.grad_scaler import GradScaler
 
+from flash_rl.agents.flashSAC.maxinfo import (
+    MaxInfoModules,
+    actor_info_gains,
+    policy_info_gain,
+)
 from flash_rl.agents.utils.network import Network
 from flash_rl.buffers import Batch
 from flash_rl.common.distributed import all_reduce_grads_average_
@@ -24,7 +29,9 @@ def _select_min_q_log_probs(
         next_q_log_probs,
         dim=0,
         index=min_indices[None, :, None].expand(1, -1, num_bins),
-    )[0]  # (B, num_bins)
+    )[
+        0
+    ]  # (B, num_bins)
     return selected
 
 
@@ -86,6 +93,7 @@ def update_actor(
     device: torch.device,
     use_amp: bool,
     grad_scaler: Optional[GradScaler],
+    maxinfo: Optional[MaxInfoModules] = None,
 ) -> dict[str, torch.Tensor]:
     """Update actor network.
 
@@ -98,6 +106,7 @@ def update_actor(
         device: Device to use.
         use_amp: Whether to use automatic mixed precision.
         grad_scaler: GradScaler for FP16 AMP.
+        maxinfo: MaxInfoSAC modules; adds the info-gain bonus to the actor objective.
     """
 
     with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
@@ -122,7 +131,46 @@ def update_actor(
         critic.network.requires_grad_(True)
 
         temp_value = temperature().detach()
-        actor_loss = (log_probs * temp_value - q).mean()
+
+        maxinfo_rows: dict[str, torch.Tensor] = {}
+        if maxinfo is not None:
+            with torch.no_grad():
+                # Evaluate the delayed policy on the SAME 2B-row batch as the live actor
+                # so both share identical UnitBatchNorm batch statistics; otherwise the
+                # normalization-context mismatch adds a constant, learning-independent
+                # offset to (info_gain - target_info_gain) that collapses the auto-tuned
+                # dyn scale (the target then differs by EMA-stale parameters only,
+                # matching the reference's norm-free actor_target semantics).
+                target_actions_all, _ = maxinfo.actor_target(
+                    observations=actor_obs_all,
+                    training=True,
+                )
+                target_actions = torch.chunk(target_actions_all.clone(), 2, dim=0)[0]
+            # Info gain of the current and the delayed policy at the batch states; the
+            # ensemble is frozen so the gradient reaches only the sampled actions.
+            # This call also updates the z-normalizer stats on these 2B rows (the
+            # reference's entropy_normalizer position).
+            maxinfo.ensemble.network.requires_grad_(False)
+            bonus_all, z_all = actor_info_gains(
+                maxinfo,
+                observations=torch.cat([batch["observation"], batch["observation"]], dim=0),  # type: ignore
+                actions=torch.cat([actions, target_actions], dim=0),
+            )
+            maxinfo.ensemble.network.requires_grad_(True)
+            bonus = torch.chunk(bonus_all, 2, dim=0)[0]
+            info_gain, target_info_gain = torch.chunk(z_all, 2, dim=0)
+            dyn_scale_value = maxinfo.dyn_scale().detach()
+            actor_loss = (log_probs * temp_value - dyn_scale_value * bonus - q).mean()
+            # Per-row z-scored gains (reference σ units) for the dyn-scale update;
+            # popped (never logged) upstream.
+            maxinfo_rows["maxinfo/info_gain_rows"] = info_gain.detach()
+            maxinfo_rows["maxinfo/target_info_gain_rows"] = target_info_gain.detach()
+            maxinfo_rows["maxinfo/bonus"] = bonus.mean().detach()
+            # Per-row magnitude: the actual exploration pressure (the mean is ~0
+            # by construction of the zero-centered z bonus).
+            maxinfo_rows["maxinfo/bonus_abs"] = bonus.abs().mean().detach()
+        else:
+            actor_loss = (log_probs * temp_value - q).mean()
 
         if bc_alpha > 0:
             # https://arxiv.org/abs/2306.02451
@@ -164,6 +212,7 @@ def update_actor(
         "mean_action": mean_action,
     }
     update_info = add_prefix_to_keys(update_info, "actor")
+    update_info.update(maxinfo_rows)
 
     return update_info
 
@@ -182,6 +231,7 @@ def update_critic(
     device: torch.device,
     use_amp: bool,
     grad_scaler: Optional[GradScaler],
+    maxinfo: Optional[MaxInfoModules] = None,
 ) -> dict[str, torch.Tensor]:
     """Update critic network.
 
@@ -199,6 +249,7 @@ def update_critic(
         device: Device to use.
         use_amp: Whether to use automatic mixed precision.
         grad_scaler: GradScaler for FP16 AMP.
+        maxinfo: MaxInfoSAC modules; adds the info-gain bonus to the TD target.
     """
 
     with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
@@ -215,6 +266,17 @@ def update_critic(
             temp_value = temperature()
 
             next_actor_entropy = temp_value * next_actor_log_probs
+            next_info_gain_mean: Optional[torch.Tensor] = None
+            if maxinfo is not None:
+                # MaxInfoSAC: subtracting the scaled info gain inside the entropy slot
+                # adds the exploration bonus to the categorical TD target.
+                next_info_gain = policy_info_gain(
+                    maxinfo,
+                    observations=batch["next_observation"],  # type: ignore
+                    actions=next_actions,
+                )
+                next_actor_entropy = next_actor_entropy - maxinfo.dyn_scale().detach() * next_info_gain
+                next_info_gain_mean = next_info_gain.mean()
             obs_all = torch.cat([batch["observation"], batch["next_observation"]], dim=0)  # type: ignore
             act_all = torch.cat([batch["action"], next_actions], dim=0)  # type: ignore
 
@@ -282,6 +344,8 @@ def update_critic(
         "max_entropy_bonus": max_entropy_bonus,
     }
     update_info = add_prefix_to_keys(update_info, "critic")
+    if next_info_gain_mean is not None:
+        update_info["maxinfo/next_info_gain"] = next_info_gain_mean
 
     return update_info
 

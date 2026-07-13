@@ -96,6 +96,7 @@ def create_envs(
             motion=kwargs.get("motion"),
             cfg_overrides=kwargs.get("cfg_overrides"),
             action_bound=kwargs.get("action_bound"),
+            obs_groups=kwargs.get("obs_groups"),
         )
         # NOTE: IsaacLab/IsaacSim only supports one SimulationApp instance per process by design.
         # See https://github.com/isaac-sim/IsaacLab/discussions/1241

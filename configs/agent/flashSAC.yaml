@@ -56,3 +56,13 @@ use_amp: true
 
 load_optimizer: true
 load_reward_normalizer: true
+
+# MaxInfoRL (MaxInfoSAC) exploration: https://arxiv.org/abs/2412.12098
+maxinfo_enabled: false
+maxinfo_num_heads: 5
+maxinfo_hidden_dim: 256
+maxinfo_num_hidden_layers: 2
+maxinfo_learn_reward: true
+maxinfo_dyn_scale_init: 1.0
+maxinfo_dyn_scale_auto: true
+maxinfo_gain_return_norm: true

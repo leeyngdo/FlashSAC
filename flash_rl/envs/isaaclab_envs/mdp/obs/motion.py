@@ -8,9 +8,9 @@ anchor and per-body state in the relevant reference frames.
 
 from __future__ import annotations
 
-import torch
 from typing import TYPE_CHECKING
 
+import torch
 from isaaclab.utils.math import matrix_from_quat, subtract_frame_transforms
 
 from ..cmds.motion_command import MotionCommand

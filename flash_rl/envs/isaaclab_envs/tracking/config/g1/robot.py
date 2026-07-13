@@ -48,9 +48,7 @@ CONTACT_PENALTY_ALLOWED_BODIES = [
     "right_wrist_yaw_link",
 ]
 
-UNDESIRED_CONTACT_BODY_REGEX = (
-    r"^" + "".join(f"(?!{body}$)" for body in CONTACT_PENALTY_ALLOWED_BODIES) + r".+$"
-)
+UNDESIRED_CONTACT_BODY_REGEX = r"^" + "".join(f"(?!{body}$)" for body in CONTACT_PENALTY_ALLOWED_BODIES) + r".+$"
 
 
 def apply_g1_tracking_profile(env_cfg: Any) -> None:

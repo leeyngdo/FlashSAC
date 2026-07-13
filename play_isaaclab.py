@@ -50,6 +50,7 @@ def play(args: argparse.Namespace) -> None:
         motion=cfg.env.get("motion", None),
         cfg_overrides=cfg.env.get("cfg_overrides", None),
         action_bound=cfg.env.get("action_bound", None),
+        obs_groups=cfg.env.get("obs_groups", None),
     )
 
     _, env_info = env.reset(random_start_init=False)
