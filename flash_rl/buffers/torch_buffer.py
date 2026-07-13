@@ -93,9 +93,13 @@ class TorchUniformBuffer(BaseBuffer):
         self._terminateds = torch.empty((m,), dtype=torch.float32, device=self._device, pin_memory=pin)
         self._truncateds = torch.empty((m,), dtype=torch.float32, device=self._device, pin_memory=pin)
 
+        self._rewards_raw = torch.empty((m,), dtype=torch.float32, device=self._device, pin_memory=pin)
+        self._dones_raw = torch.empty((m,), dtype=torch.float32, device=self._device, pin_memory=pin)
+
         self._n_step_transitions: deque[dict[str, Any]] = deque(maxlen=self._n_step)
         self._num_in_buffer = 0
         self._current_idx = 0
+        self._add_batch_size: Optional[int] = None
 
     def _to_tensor(self, value: Any) -> torch.Tensor:
         """Convert a value to a tensor on the buffer device (cloned if already a tensor)."""
@@ -145,9 +149,19 @@ class TorchUniformBuffer(BaseBuffer):
         self._n_step_transitions.append({key: self._to_tensor(value) for key, value in transition.items()})
 
         if len(self._n_step_transitions) >= self._n_step:
+            # Raw 1-step reward/done of the transition being written, captured
+            # BEFORE the n-step aggregation overwrites them in place. Consumed by
+            # sample_one_step (the maxinfo ensemble's replay pairs).
+            raw = self._n_step_transitions[0]
+            raw_reward = raw["reward"].to(torch.float32).clone()
+            raw_done = torch.clamp(raw["terminated"].to(torch.float32) + raw["truncated"].to(torch.float32), max=1.0)
             n_step_prev_transition = cast(dict[str, torch.Tensor], self._get_n_step_prev_transition())
 
             add_batch_size = len(n_step_prev_transition["observation"])
+            if self._add_batch_size is None:
+                self._add_batch_size = add_batch_size
+            elif add_batch_size != self._add_batch_size:
+                raise ValueError("sample_one_step requires a constant add batch size")
             end_idx = self._current_idx + add_batch_size
 
             if end_idx <= self._max_length:
@@ -162,6 +176,8 @@ class TorchUniformBuffer(BaseBuffer):
             self._rewards[idxs] = n_step_prev_transition["reward"].to(self._rewards.dtype)
             self._terminateds[idxs] = n_step_prev_transition["terminated"].to(self._terminateds.dtype)
             self._truncateds[idxs] = n_step_prev_transition["truncated"].to(self._truncateds.dtype)
+            self._rewards_raw[idxs] = raw_reward
+            self._dones_raw[idxs] = raw_done
 
             self._num_in_buffer = min(self._num_in_buffer + add_batch_size, self._max_length)
             self._current_idx = (self._current_idx + add_batch_size) % self._max_length
@@ -189,6 +205,39 @@ class TorchUniformBuffer(BaseBuffer):
 
         return batch
 
+    def sample_one_step(self, batch_size: int) -> dict[str, torch.Tensor]:
+        """Sample raw 1-step transitions (s_t, a_t, r_t, s_{t+1}) for the dynamics ensemble.
+
+        The ring stores one add-batch (num_envs rows) per env step, so slot
+        i + add_batch_size holds the SAME env's next step — the 1-step next
+        observation is read by index with zero extra storage. Rewards/dones are
+        the RAW 1-step values captured at add() time (the main columns hold
+        n-step aggregates). A done row's successor slot belongs to the next
+        episode, so it is returned flagged (done=1) for the caller to mask; the
+        newest add-batch is excluded because its successor is not written yet.
+        """
+        assert self._add_batch_size is not None, "buffer has not been written yet"
+        E = self._add_batch_size
+        M = self._max_length
+        high = self._num_in_buffer - E
+        assert high > 0, "not enough data for 1-step pairs"
+        idx = torch.randint(0, high, (batch_size,), device=self._device)
+        if self._num_in_buffer == self._max_length:
+            idx = (idx + self._current_idx) % M
+        next_idx = (idx + E) % M
+        observations = self._observations[idx]
+        next_observations = self._observations[next_idx]
+        if self._obs_storage_dtype is not None:
+            observations = observations.to(torch.float32)
+            next_observations = next_observations.to(torch.float32)
+        return {
+            "observation": observations,
+            "action": self._actions[idx].to(torch.float32),
+            "reward": self._rewards_raw[idx],
+            "next_observation": next_observations,
+            "done": self._dones_raw[idx],
+        }
+
     def save(self, path: str) -> None:
         """
         Save buffer contents and metadata.
@@ -204,6 +253,8 @@ class TorchUniformBuffer(BaseBuffer):
             "terminated": self._terminateds[:n],
             "truncated": self._truncateds[:n],
             "next_observation": self._next_observations[:n],
+            "reward_raw": self._rewards_raw[:n],
+            "done_raw": self._dones_raw[:n],
             "num_in_buffer": self._num_in_buffer,
             "current_idx": self._current_idx,
         }
@@ -224,6 +275,9 @@ class TorchUniformBuffer(BaseBuffer):
         self._rewards[:n] = dataset["reward"]
         self._terminateds[:n] = dataset["terminated"]
         self._truncateds[:n] = dataset["truncated"]
+        if "reward_raw" in dataset:
+            self._rewards_raw[:n] = dataset["reward_raw"]
+            self._dones_raw[:n] = dataset["done_raw"]
 
         self._num_in_buffer = n
         self._current_idx = dataset["current_idx"]
@@ -271,6 +325,9 @@ class MemoryEfficientTorchUniformBuffer(TorchUniformBuffer):
         self._terminateds = torch.empty((m,), dtype=torch.float32, device=self._device, pin_memory=pin)
         self._truncateds = torch.empty((m,), dtype=torch.float32, device=self._device, pin_memory=pin)
 
+        self._rewards_raw = torch.empty((m,), dtype=torch.float32, device=self._device, pin_memory=pin)
+        self._dones_raw = torch.empty((m,), dtype=torch.float32, device=self._device, pin_memory=pin)
+
         self._n_step_transitions: deque[dict[str, Any]] = deque(maxlen=self._n_step)
         self._num_in_buffer = 0
         self._current_idx = 0
@@ -283,6 +340,9 @@ class MemoryEfficientTorchUniformBuffer(TorchUniformBuffer):
         if len(self._n_step_transitions) < self._n_step:
             return
 
+        raw = self._n_step_transitions[0]
+        raw_reward = raw["reward"].to(torch.float32).clone()
+        raw_done = torch.clamp(raw["terminated"].to(torch.float32) + raw["truncated"].to(torch.float32), max=1.0)
         n_step_prev_transition = cast(dict[str, torch.Tensor], self._get_n_step_prev_transition())
         add_batch_size = len(n_step_prev_transition["observation"])
         if self._add_batch_size is None:
@@ -304,6 +364,8 @@ class MemoryEfficientTorchUniformBuffer(TorchUniformBuffer):
         self._rewards[idxs] = n_step_prev_transition["reward"].to(self._rewards.dtype)
         self._terminateds[idxs] = n_step_prev_transition["terminated"].to(self._terminateds.dtype)
         self._truncateds[idxs] = n_step_prev_transition["truncated"].to(self._truncateds.dtype)
+        self._rewards_raw[idxs] = raw_reward
+        self._dones_raw[idxs] = raw_done
 
         if self._episode_end_next_observations:
             if end_idx > self._max_length:
@@ -382,6 +444,8 @@ class MemoryEfficientTorchUniformBuffer(TorchUniformBuffer):
                 "reward": self._rewards[:n],
                 "terminated": self._terminateds[:n],
                 "truncated": self._truncateds[:n],
+                "reward_raw": self._rewards_raw[:n],
+                "done_raw": self._dones_raw[:n],
                 "num_in_buffer": self._num_in_buffer,
                 "current_idx": self._current_idx,
                 "add_batch_size": self._add_batch_size,
@@ -399,6 +463,9 @@ class MemoryEfficientTorchUniformBuffer(TorchUniformBuffer):
         self._rewards[:n] = dataset["reward"]
         self._terminateds[:n] = dataset["terminated"]
         self._truncateds[:n] = dataset["truncated"]
+        if "reward_raw" in dataset:
+            self._rewards_raw[:n] = dataset["reward_raw"]
+            self._dones_raw[:n] = dataset["done_raw"]
         self._num_in_buffer = n
         self._current_idx = dataset["current_idx"]
         self._add_batch_size = dataset["add_batch_size"]

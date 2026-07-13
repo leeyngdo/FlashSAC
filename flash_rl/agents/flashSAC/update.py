@@ -3,7 +3,11 @@ from typing import Any, Optional
 import torch
 from torch.amp.grad_scaler import GradScaler
 
-from flash_rl.agents.flashSAC.maxinfo import MaxInfoModules, policy_info_gain
+from flash_rl.agents.flashSAC.maxinfo import (
+    MaxInfoModules,
+    actor_info_gains,
+    policy_info_gain,
+)
 from flash_rl.agents.utils.network import Network
 from flash_rl.buffers import Batch
 from flash_rl.common.distributed import all_reduce_grads_average_
@@ -25,7 +29,9 @@ def _select_min_q_log_probs(
         next_q_log_probs,
         dim=0,
         index=min_indices[None, :, None].expand(1, -1, num_bins),
-    )[0]  # (B, num_bins)
+    )[
+        0
+    ]  # (B, num_bins)
     return selected
 
 
@@ -142,20 +148,27 @@ def update_actor(
                 target_actions = torch.chunk(target_actions_all.clone(), 2, dim=0)[0]
             # Info gain of the current and the delayed policy at the batch states; the
             # ensemble is frozen so the gradient reaches only the sampled actions.
+            # This call also updates the z-normalizer stats on these 2B rows (the
+            # reference's entropy_normalizer position).
             maxinfo.ensemble.network.requires_grad_(False)
-            gain_all = policy_info_gain(
+            bonus_all, z_all = actor_info_gains(
                 maxinfo,
                 observations=torch.cat([batch["observation"], batch["observation"]], dim=0),  # type: ignore
                 actions=torch.cat([actions, target_actions], dim=0),
-                update_stats=True,
             )
             maxinfo.ensemble.network.requires_grad_(True)
-            info_gain, target_info_gain = torch.chunk(gain_all, 2, dim=0)
+            bonus = torch.chunk(bonus_all, 2, dim=0)[0]
+            info_gain, target_info_gain = torch.chunk(z_all, 2, dim=0)
             dyn_scale_value = maxinfo.dyn_scale().detach()
-            actor_loss = (log_probs * temp_value - dyn_scale_value * info_gain - q).mean()
-            # Per-row gains for the dyn-scale update; popped (never logged) upstream.
+            actor_loss = (log_probs * temp_value - dyn_scale_value * bonus - q).mean()
+            # Per-row z-scored gains (reference σ units) for the dyn-scale update;
+            # popped (never logged) upstream.
             maxinfo_rows["maxinfo/info_gain_rows"] = info_gain.detach()
             maxinfo_rows["maxinfo/target_info_gain_rows"] = target_info_gain.detach()
+            maxinfo_rows["maxinfo/bonus"] = bonus.mean().detach()
+            # Per-row magnitude: the actual exploration pressure (the mean is ~0
+            # by construction of the zero-centered z bonus).
+            maxinfo_rows["maxinfo/bonus_abs"] = bonus.abs().mean().detach()
         else:
             actor_loss = (log_probs * temp_value - q).mean()
 
@@ -261,7 +274,6 @@ def update_critic(
                     maxinfo,
                     observations=batch["next_observation"],  # type: ignore
                     actions=next_actions,
-                    update_stats=False,
                 )
                 next_actor_entropy = next_actor_entropy - maxinfo.dyn_scale().detach() * next_info_gain
                 next_info_gain_mean = next_info_gain.mean()

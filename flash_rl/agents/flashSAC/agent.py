@@ -16,6 +16,7 @@ from flash_rl.agents.flashSAC.maxinfo import (
     init_maxinfo,
     update_dyn_scale,
     update_ensemble,
+    update_gain_stats,
 )
 from flash_rl.agents.flashSAC.network import (
     FlashSACActor,
@@ -102,6 +103,9 @@ class FlashSACConfig:
     maxinfo_learn_reward: bool = True
     maxinfo_dyn_scale_init: float = 1.0
     maxinfo_dyn_scale_auto: bool = True
+    # False = skip stage-2 return-std scaling: bonus is the stage-1 z alone
+    # (reference sigma units). Ablation knob.
+    maxinfo_gain_return_norm: bool = True
 
 
 def _init_flashsac_networks(
@@ -367,10 +371,14 @@ def _update_networks(
         target_network=target_critic,
     )
 
-    # Train the dynamics ensemble alongside the critic target update
+    # The ensemble trains on replayed raw 1-step transitions in FlashSACAgent.update,
+    # not on this batch (see update_ensemble); only log the gain scale here.
     maxinfo_info: dict[str, torch.Tensor] = {}
-    if maxinfo is not None:
-        maxinfo_info = update_ensemble(maxinfo, batch)
+    if maxinfo is not None and maxinfo.gain_return_norm:
+        gn = maxinfo.gain_normalizer
+        maxinfo_info["maxinfo/gain_scale"] = torch.maximum(
+            torch.sqrt(gn.G_rms.var + gn.epsilon), gn.G_r_max / gn.G_max
+        ).mean()
 
     # Merge all info dicts
     update_info = {
@@ -570,6 +578,21 @@ class FlashSACAgent(BaseAgent[FlashSACConfig]):
         # add to replay buffer
         self._replay_buffer.add(transition)
 
+        # update the maxinfo gain normalizer's discounted-return stats on the
+        # behavior policy's (temporally ordered) transitions, like the reward path.
+        # Gated until training starts: prefill gains are raw-scale, and the mean
+        # shift they put on G would suppress the std scale several-fold for most
+        # of the run — a mean shift leaves the variance merge only linearly in
+        # sample count. The ensemble models the full (critic-view) observation.
+        if self._maxinfo is not None and self.can_start_training():
+            update_gain_stats(
+                self._maxinfo,
+                observations=torch.as_tensor(transition["observation"], dtype=torch.float32, device=self._device),
+                actions=torch.as_tensor(transition["action"], dtype=torch.float32, device=self._device),
+                terminated=torch.as_tensor(transition["terminated"], device=self._device),
+                truncated=torch.as_tensor(transition["truncated"], device=self._device),
+            )
+
         # update reward normalizer
         if self._cfg.normalize_reward:
             assert "reward" in transition and self.reward_normalizer is not None
@@ -603,6 +626,24 @@ class FlashSACAgent(BaseAgent[FlashSACConfig]):
             # batch["unnormalized_reward"] = batch["reward"].clone()
             batch["reward"] = self.reward_normalizer.normalize_rewards(batch["reward"])
 
+        # Train the maxinfo ensemble on replayed raw 1-step transitions — the
+        # reference's data source (uniform replay). The buffer reads s_{t+1} by
+        # index (slot i + num_envs); a done row's target belongs to the next
+        # episode, so it comes back flagged and is masked out.
+        maxinfo_ensemble_info: dict[str, torch.Tensor] = {}
+        if self._maxinfo is not None:
+            w = self._replay_buffer.sample_one_step(self._cfg.sample_batch_size)
+            # Like the batch above: the buffer may live on cpu while the ensemble is on cuda.
+            w = {key: value.to(self._device, non_blocking=True) for key, value in w.items()}
+            maxinfo_ensemble_info = update_ensemble(
+                self._maxinfo,
+                observations=w["observation"],
+                actions=w["action"],
+                next_observations=w["next_observation"],
+                rewards=w["reward"],
+                valid=1.0 - w["done"],
+            )
+
         # Update step
         _update_info = _update_networks(
             batch=batch,
@@ -617,6 +658,7 @@ class FlashSACAgent(BaseAgent[FlashSACConfig]):
             maxinfo=self._maxinfo,
         )
         self._update_step += 1
+        _update_info = {**maxinfo_ensemble_info, **_update_info}
 
         # Convert tensors to floats
         update_info: dict[str, float] = {}
@@ -638,6 +680,7 @@ class FlashSACAgent(BaseAgent[FlashSACConfig]):
             self._maxinfo.ensemble.save(os.path.join(path, "maxinfo_ensemble.pt"))
             self._maxinfo.dyn_scale.save(os.path.join(path, "maxinfo_dyn_scale.pt"))
             self._maxinfo.actor_target.save(os.path.join(path, "maxinfo_actor_target.pt"))
+            self._maxinfo.gain_normalizer.save(os.path.join(path, "maxinfo_gain_normalizer.pt"))
         if self.reward_normalizer is not None:
             self.reward_normalizer.save(os.path.join(path, "reward_normalizer.pt"))
 
@@ -665,6 +708,7 @@ class FlashSACAgent(BaseAgent[FlashSACConfig]):
                 load_optimizer=load_optimizer and self._maxinfo.dyn_scale_auto,
             )
             self._maxinfo.actor_target.load(os.path.join(path, "maxinfo_actor_target.pt"), load_optimizer=False)
+            self._maxinfo.gain_normalizer.load(os.path.join(path, "maxinfo_gain_normalizer.pt"))
 
         # Load agent-level optimizer state
         if load_optimizer:
