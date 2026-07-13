@@ -165,6 +165,8 @@ models/**
 models
 # IsaacLab motion-tracking assets (large; fetch locally, do not commit)
 flash_rl/envs/isaaclab_envs/assets/unitree_description/
+# SimToolReal robot/table assets (large; fetch via scripts/fetch_simtoolreal_assets.sh)
+flash_rl/envs/isaaclab_envs/assets/simtoolreal_description/
 flash_rl/envs/isaaclab_envs/motions/*.npz
 flash_rl/envs/isaaclab_envs/motions/lafan1_csv/
 
