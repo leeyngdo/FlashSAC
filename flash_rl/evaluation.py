@@ -13,6 +13,10 @@ def evaluate(
     num_episodes: int,
     env_type: str,
 ) -> dict[str, float]:
+    eval_mode = getattr(env, "set_eval_mode", None)
+    if callable(eval_mode):
+        eval_mode(True)
+
     num_envs = env.num_envs
 
     assert num_episodes % num_envs == 0, "num_episodes must be divisible by env.num_envs"
@@ -83,6 +87,8 @@ def evaluate(
         "avg_success_end": float(np.mean(total_success_end_list)),
     }
 
+    if callable(eval_mode):
+        eval_mode(False)
     env.reset()
 
     return eval_info
@@ -97,6 +103,11 @@ def record_video(
 ) -> dict[str, Any]:
     if num_episodes == 0:
         return {}
+
+    eval_mode = getattr(env, "set_eval_mode", None)
+    if callable(eval_mode):
+        eval_mode(True)
+
     num_envs = env.num_envs
     # assert num_episodes % num_envs == 0, "num_episodes must be divisible by env.num_envs"
     num_eval_episodes_per_env = max(num_episodes // num_envs, 1)
@@ -143,6 +154,8 @@ def record_video(
 
     video_info = {"video": total_videos}
 
+    if callable(eval_mode):
+        eval_mode(False)
     env.reset()
 
     return video_info

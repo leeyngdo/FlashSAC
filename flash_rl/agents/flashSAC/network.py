@@ -22,12 +22,19 @@ class FlashSACActor(nn.Module):
         input_dim: int,
         hidden_dim: int,
         action_dim: int,
+        action_bias: torch.Tensor,
+        action_range: torch.Tensor,
     ):
         super().__init__()
         self.embedder = FlashSACEmbedder(input_dim=input_dim, hidden_dim=hidden_dim)
         self.encoder = nn.ModuleList([FlashSACBlock(hidden_dim) for _ in range(num_blocks)])
         self.post_norm = UnitRMSNorm(hidden_dim)
-        self.predictor = NormalTanhPolicy(hidden_dim=hidden_dim, action_dim=action_dim)
+        self.predictor = NormalTanhPolicy(
+            hidden_dim=hidden_dim,
+            action_dim=action_dim,
+            action_bias=action_bias,
+            action_range=action_range,
+        )
 
     def get_mean_and_std(
         self,

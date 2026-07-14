@@ -4,6 +4,7 @@ from dataclasses import dataclass, replace
 from typing import Any, MutableMapping, Optional, cast
 
 import gymnasium as gym
+import numpy as np
 import torch
 import torch.optim as optim
 from torch.amp.grad_scaler import GradScaler
@@ -24,6 +25,7 @@ from flash_rl.agents.utils.network import Network
 from flash_rl.agents.utils.reward_normalization import RewardNormalizer
 from flash_rl.agents.utils.scheduler import warmup_cosine_decay_scheduler
 from flash_rl.buffers import create_buffer
+from flash_rl.common.distributed import broadcast_parameters_, resolve_device_type
 from flash_rl.types import NDArray, Tensor
 
 
@@ -65,7 +67,7 @@ class FlashSACConfig:
 
     temp_initial_value: float
     temp_target_sigma: float
-    temp_target_entropy: float
+    temp_target_entropy: float | None
 
     gamma: float
     n_step: int
@@ -76,6 +78,9 @@ class FlashSACConfig:
 
     load_optimizer: bool
     load_reward_normalizer: bool
+
+    buffer_obs_dtype: Optional[str] = None
+    buffer_optimize_memory_usage: bool = True
 
     # --- recency-biased replay ---
     buffer_class_type: str = "torch"
@@ -88,6 +93,8 @@ def _init_flashsac_networks(
     actor_observation_dim: int,
     critic_observation_dim: int,
     action_dim: int,
+    action_bias: torch.Tensor,
+    action_range: torch.Tensor,
     cfg: FlashSACConfig,
     device: torch.device,
 ) -> tuple[Network, Network, Network, Network]:
@@ -106,6 +113,8 @@ def _init_flashsac_networks(
         input_dim=actor_observation_dim,
         hidden_dim=cfg.actor_hidden_dim,
         action_dim=action_dim,
+        action_bias=action_bias,
+        action_range=action_range,
     ).to(device)
 
     use_fused = device.type == "cuda" and torch.cuda.is_available()
@@ -231,6 +240,8 @@ def _sample_flashsac_actions(
     noise: torch.Tensor,
     observations: torch.Tensor,
     temperature: float,
+    action_bias: torch.Tensor,
+    action_range: torch.Tensor,
     cur_count: torch.Tensor,
     cur_n: torch.Tensor,
     zeta_cdf: torch.Tensor,
@@ -244,7 +255,7 @@ def _sample_flashsac_actions(
     )
     # return deterministic actions without changing noise sampling params
     if temperature == 0.0:
-        actions = torch.tanh(mean)
+        actions = action_bias + action_range * torch.tanh(mean)
         return noise, actions, cur_count, cur_n
 
     # reinit noise after a certain number of steps (only during training)
@@ -258,7 +269,7 @@ def _sample_flashsac_actions(
     cur_count = torch.where(reinit, torch.zeros_like(cur_count), cur_count)
 
     # sample action
-    actions = torch.tanh(mean + std * noise * temperature)
+    actions = action_bias + action_range * torch.tanh(mean + std * noise * temperature)
 
     return noise, actions, cur_count + 1, cur_n
 
@@ -291,7 +302,7 @@ def _update_networks(
         temperature_info = update_temperature(
             temperature=temperature,
             entropy=actor_info["actor/entropy"],
-            target_entropy=cfg.temp_target_entropy,
+            target_entropy=cast(float, cfg.temp_target_entropy),
         )
     else:
         actor_info = {}
@@ -358,7 +369,27 @@ class FlashSACAgent(BaseAgent[FlashSACConfig]):
         else:
             self._actor_observation_dim = self._critic_observation_dim
 
-        temp_target_entropy = 0.5 * self._action_dim * math.log(2 * math.pi * math.e * cfg.temp_target_sigma**2)
+        self._device = torch.device(resolve_device_type(cfg.device_type))
+
+        if not isinstance(action_space, gym.spaces.Box):
+            raise TypeError(f"FlashSAC expects a Box action space, got {type(action_space).__name__}.")
+        action_low = torch.as_tensor(np.asarray(action_space.low), dtype=torch.float32, device=self._device)
+        action_high = torch.as_tensor(np.asarray(action_space.high), dtype=torch.float32, device=self._device)
+        action_low = action_low.reshape(-1, self._action_dim)[0]
+        action_high = action_high.reshape(-1, self._action_dim)[0]
+        if not torch.isfinite(action_low).all() or not torch.isfinite(action_high).all():
+            raise ValueError("FlashSAC requires finite action bounds for tanh-squashed policies.")
+        self._action_range = 0.5 * (action_high - action_low)
+        if (self._action_range < 0).any():
+            raise ValueError("FlashSAC received an action space with high < low.")
+        self._action_bias = 0.5 * (action_high + action_low)
+
+        if cfg.temp_target_entropy is None:
+            base_target_entropy = 0.5 * self._action_dim * math.log(2 * math.pi * math.e * cfg.temp_target_sigma**2)
+            log_action_range = torch.log(torch.clamp(self._action_range.abs(), min=1e-6)).sum().item()
+            temp_target_entropy = base_target_entropy + log_action_range
+        else:
+            temp_target_entropy = cfg.temp_target_entropy
         compile_mode = _resolve_compile_mode(cfg.compile_mode)
         cfg = replace(cfg, temp_target_entropy=temp_target_entropy, compile_mode=compile_mode)
 
@@ -370,14 +401,6 @@ class FlashSACAgent(BaseAgent[FlashSACConfig]):
         )
         self._cfg = cfg
 
-        device_type = cfg.device_type
-        device_type = (
-            device_type
-            if device_type.startswith("cuda") and ":" in device_type
-            else ("cuda:0" if device_type.startswith("cuda") else "cpu")
-        )
-        self._device = torch.device(device_type)
-
         # Initialize networks
         (
             self._actor,
@@ -388,8 +411,21 @@ class FlashSACAgent(BaseAgent[FlashSACConfig]):
             actor_observation_dim=self._actor_observation_dim,
             critic_observation_dim=self._critic_observation_dim,
             action_dim=self._action_dim,
+            action_bias=self._action_bias,
+            action_range=self._action_range,
             cfg=self._cfg,
             device=self._device,
+        )
+        # Sync initial weights from rank 0 so every data-parallel rank starts identical.
+        # No-op when training in a single process.
+        broadcast_parameters_(
+            [
+                self._actor.network,
+                self._critic.network,
+                self._target_critic.network,
+                self._temperature.network,
+            ],
+            src=0,
         )
         self._update_step = 0
 
@@ -417,6 +453,7 @@ class FlashSACAgent(BaseAgent[FlashSACConfig]):
 
         # Replay buffer. The geometric sampler is the paper's truncated-geometric
         # recency bias; setting alpha=0 or buffer_type=uniform recovers uniform replay.
+        _obs_dtype = getattr(torch, self._cfg.buffer_obs_dtype) if self._cfg.buffer_obs_dtype is not None else None
         self._replay_buffer = create_buffer(
             buffer_class_type=self._cfg.buffer_class_type,
             buffer_type=self._cfg.buffer_type,
@@ -427,8 +464,10 @@ class FlashSACAgent(BaseAgent[FlashSACConfig]):
             max_length=self._cfg.buffer_max_length,
             min_length=self._cfg.buffer_min_length,
             sample_batch_size=self._cfg.sample_batch_size,
-            device_type=self._cfg.buffer_device_type,
+            device_type=resolve_device_type(self._cfg.buffer_device_type),
             geom_alpha=self._cfg.buffer_geom_alpha,
+            optimize_memory_usage=self._cfg.buffer_optimize_memory_usage,
+            obs_storage_dtype=_obs_dtype,
         )
 
     def sample_actions(
@@ -459,6 +498,8 @@ class FlashSACAgent(BaseAgent[FlashSACConfig]):
                 noise=self._cached_noise,
                 observations=observations,
                 temperature=temperature,
+                action_bias=self._action_bias,
+                action_range=self._action_range,
                 cur_count=self._cur_noise_repeat_count,
                 cur_n=self._cur_noise_repeat_n,
                 zeta_cdf=self._zeta_cdf,

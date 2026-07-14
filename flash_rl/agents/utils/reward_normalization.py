@@ -2,8 +2,15 @@ import os
 from typing import TypeVar
 
 import torch
+import torch.distributed as dist
 
 Config = TypeVar("Config")
+
+
+def _dist_world_size() -> int:
+    if dist.is_available() and dist.is_initialized():
+        return dist.get_world_size()
+    return 1
 
 
 @torch.compile
@@ -36,18 +43,16 @@ def _scale_reward(
 
 
 @torch.compile
-def _update_mean_var_count_from_moments(
-    samples: torch.Tensor,
+def _update_mean_var_count_from_batch_moments(
+    sample_mean: torch.Tensor,
+    sample_var: torch.Tensor,
+    sample_count: torch.Tensor,
     running_mean: torch.Tensor,
     running_var: torch.Tensor,
     running_count: torch.Tensor,
     epsilon: float,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Updates the mean, var and count using the previous mean, var, count and batch values."""
-    sample_mean = torch.mean(samples, dim=0)
-    sample_var = torch.var(samples, dim=0, unbiased=False)
-    sample_count = float(samples.shape[0])
-
     delta = sample_mean - running_mean
     total_count = running_count + sample_count
     ratio = sample_count / total_count
@@ -63,6 +68,21 @@ def _update_mean_var_count_from_moments(
         new_var,
         total_count,
     )
+
+
+def _get_batch_moments(samples: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    sample_count = torch.tensor(float(samples.shape[0]), dtype=samples.dtype, device=samples.device)
+    sample_sum = torch.sum(samples, dim=0)
+    sample_sumsq = torch.sum(torch.square(samples), dim=0)
+
+    if _dist_world_size() > 1:
+        dist.all_reduce(sample_count, op=dist.ReduceOp.SUM)
+        dist.all_reduce(sample_sum, op=dist.ReduceOp.SUM)
+        dist.all_reduce(sample_sumsq, op=dist.ReduceOp.SUM)
+
+    sample_mean = sample_sum / sample_count
+    sample_var = torch.clamp(sample_sumsq / sample_count - torch.square(sample_mean), min=0.0)
+    return sample_mean, sample_var, sample_count
 
 
 class RewardNormalizer:
@@ -110,6 +130,8 @@ class RewardNormalizer:
             G_r_max=self.G_r_max,
             gamma=self.gamma,
         )
+        if _dist_world_size() > 1:
+            dist.all_reduce(self.G_r_max, op=dist.ReduceOp.MAX)
         self.G_rms.update(self.G_r)
 
     def normalize_rewards(self, rewards: torch.Tensor) -> torch.Tensor:
@@ -172,8 +194,13 @@ class RunningMeanStd:
 
     def update(self, x: torch.Tensor) -> None:
         """Updates the mean, var and count from a batch of samples."""
-        self.mean, self.var, self.count = _update_mean_var_count_from_moments(
-            samples=x,
+        sample_shape = tuple(self.mean.shape)
+        samples = x.reshape(-1, *sample_shape) if sample_shape else x.reshape(-1)
+        sample_mean, sample_var, sample_count = _get_batch_moments(samples)
+        self.mean, self.var, self.count = _update_mean_var_count_from_batch_moments(
+            sample_mean=sample_mean,
+            sample_var=sample_var,
+            sample_count=sample_count,
             running_mean=self.mean,
             running_var=self.var,
             running_count=self.count,

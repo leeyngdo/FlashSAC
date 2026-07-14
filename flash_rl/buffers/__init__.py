@@ -6,6 +6,7 @@ from ..types import NDArray
 from .base_buffer import BaseBuffer, Batch  # noqa
 from .numpy_buffer import NpyUniformBuffer
 from .torch_buffer import (
+    MemoryEfficientTorchUniformBuffer,
     TorchGeometricBuffer,
     TorchUniformBuffer,
 )
@@ -13,6 +14,7 @@ from .torch_buffer import (
 __all__ = [
     "BaseBuffer",
     "Batch",
+    "MemoryEfficientTorchUniformBuffer",
     "NpyUniformBuffer",
     "TorchUniformBuffer",
     "TorchGeometricBuffer",
@@ -57,10 +59,15 @@ def create_buffer(
             min_length=min_length,
             sample_batch_size=sample_batch_size,
             device_type=kwargs["device_type"],
+            obs_storage_dtype=kwargs.get("obs_storage_dtype"),
         )
+        optimize_memory_usage = kwargs.get("optimize_memory_usage", False)
         if buffer_type == "uniform":
-            return TorchUniformBuffer(**common)
+            buffer_cls = MemoryEfficientTorchUniformBuffer if optimize_memory_usage else TorchUniformBuffer
+            return buffer_cls(**common)
         elif buffer_type in ("geometric", "exponential"):
+            if optimize_memory_usage:
+                raise NotImplementedError("memory-efficient geometric buffer is not implemented")
             return TorchGeometricBuffer(
                 **common,
                 geom_alpha=kwargs.get("geom_alpha", 10.0),
