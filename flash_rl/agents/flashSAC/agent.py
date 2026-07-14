@@ -24,10 +24,7 @@ from flash_rl.agents.flashSAC.update import (
 from flash_rl.agents.utils.network import Network
 from flash_rl.agents.utils.reward_normalization import RewardNormalizer
 from flash_rl.agents.utils.scheduler import warmup_cosine_decay_scheduler
-from flash_rl.buffers.torch_buffer import (
-    MemoryEfficientTorchUniformBuffer,
-    TorchUniformBuffer,
-)
+from flash_rl.buffers import create_buffer
 from flash_rl.common.distributed import broadcast_parameters_, resolve_device_type
 from flash_rl.types import NDArray, Tensor
 
@@ -84,6 +81,12 @@ class FlashSACConfig:
 
     buffer_obs_dtype: Optional[str] = None
     buffer_optimize_memory_usage: bool = True
+
+    # --- recency-biased replay ---
+    buffer_class_type: str = "torch"
+    buffer_type: str = "geometric"  # uniform | geometric
+    # GEOM / Truncated Geometric (buffer_type='geometric')
+    buffer_geom_alpha: float = 10.0
 
 
 def _init_flashsac_networks(
@@ -448,10 +451,12 @@ class FlashSACAgent(BaseAgent[FlashSACConfig]):
                 device=self._device,
             )
 
-        # Replay buffer
+        # Replay buffer. The geometric sampler is the paper's truncated-geometric
+        # recency bias; setting alpha=0 or buffer_type=uniform recovers uniform replay.
         _obs_dtype = getattr(torch, self._cfg.buffer_obs_dtype) if self._cfg.buffer_obs_dtype is not None else None
-        buffer_cls = MemoryEfficientTorchUniformBuffer if self._cfg.buffer_optimize_memory_usage else TorchUniformBuffer
-        self._replay_buffer = buffer_cls(
+        self._replay_buffer = create_buffer(
+            buffer_class_type=self._cfg.buffer_class_type,
+            buffer_type=self._cfg.buffer_type,
             observation_space=observation_space,
             action_space=action_space,
             n_step=self._cfg.n_step,
@@ -460,6 +465,8 @@ class FlashSACAgent(BaseAgent[FlashSACConfig]):
             min_length=self._cfg.buffer_min_length,
             sample_batch_size=self._cfg.sample_batch_size,
             device_type=resolve_device_type(self._cfg.buffer_device_type),
+            geom_alpha=self._cfg.buffer_geom_alpha,
+            optimize_memory_usage=self._cfg.buffer_optimize_memory_usage,
             obs_storage_dtype=_obs_dtype,
         )
 

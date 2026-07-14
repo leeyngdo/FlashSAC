@@ -5,14 +5,21 @@ import gymnasium as gym
 from ..types import NDArray
 from .base_buffer import BaseBuffer, Batch  # noqa
 from .numpy_buffer import NpyUniformBuffer
-from .torch_buffer import MemoryEfficientTorchUniformBuffer, TorchUniformBuffer
+from .torch_buffer import (
+    MemoryEfficientTorchGeometricBuffer,
+    MemoryEfficientTorchUniformBuffer,
+    TorchGeometricBuffer,
+    TorchUniformBuffer,
+)
 
 __all__ = [
     "BaseBuffer",
     "Batch",
+    "MemoryEfficientTorchGeometricBuffer",
     "MemoryEfficientTorchUniformBuffer",
     "NpyUniformBuffer",
     "TorchUniformBuffer",
+    "TorchGeometricBuffer",
     "create_buffer",
 ]
 
@@ -45,6 +52,28 @@ def create_buffer(
     elif buffer_class_type == "jax":
         raise NotImplementedError
     elif buffer_class_type == "torch":
-        raise NotImplementedError
+        common = dict(
+            observation_space=observation_space,
+            action_space=action_space,
+            n_step=n_step,
+            gamma=gamma,
+            max_length=max_length,
+            min_length=min_length,
+            sample_batch_size=sample_batch_size,
+            device_type=kwargs["device_type"],
+            obs_storage_dtype=kwargs.get("obs_storage_dtype"),
+        )
+        optimize_memory_usage = kwargs.get("optimize_memory_usage", False)
+        if buffer_type == "uniform":
+            buffer_cls = MemoryEfficientTorchUniformBuffer if optimize_memory_usage else TorchUniformBuffer
+            return buffer_cls(**common)
+        elif buffer_type in ("geometric", "exponential"):
+            geom_cls = MemoryEfficientTorchGeometricBuffer if optimize_memory_usage else TorchGeometricBuffer
+            return geom_cls(
+                **common,
+                geom_alpha=kwargs.get("geom_alpha", 10.0),
+            )
+        else:
+            raise NotImplementedError(f"Unknown torch buffer_type: {buffer_type}")
     else:
         raise ValueError(f"Invalid buffer class type: {buffer_class_type}")

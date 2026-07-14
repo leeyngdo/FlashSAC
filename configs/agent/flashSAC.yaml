@@ -14,6 +14,11 @@ sample_batch_size: 2048
 buffer_obs_dtype: null
 buffer_optimize_memory_usage: true
 
+# --- recency-biased replay ---
+buffer_class_type: 'torch'
+buffer_type: 'geometric'                     # uniform | geometric
+buffer_geom_alpha: 10.0                      # GEOM alpha from the paper; 0 => uniform
+
 normalize_reward: true
 normalized_G_max: 5.0
 
