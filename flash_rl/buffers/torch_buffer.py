@@ -334,13 +334,21 @@ class TorchGeometricBuffer(TorchUniformBuffer):
         self.sampler.size = 0
         self.sampler.Z = 1.0
 
+    def _geom_window(self) -> int:
+        """Number of entries the sampler may draw from, anchored at the oldest entry."""
+        return self._num_in_buffer
+
+    def _refresh_sampler(self) -> None:
+        # compute_Z is O(1); the guard short-circuits once the window stops growing.
+        window = self._geom_window()
+        if self.sampler.size != window:
+            self.sampler.size = window
+            self.sampler.Z = self.sampler.compute_Z(window)
+
     def add(self, transition: Batch) -> None:
         super().add(transition)
         # After super().add advances _num_in_buffer, refresh the sampler size / Z.
-        # compute_Z is O(1); the guard short-circuits once the buffer is full.
-        if self.sampler.size != self._num_in_buffer:
-            self.sampler.size = self._num_in_buffer
-            self.sampler.Z = self.sampler.compute_Z(self._num_in_buffer)
+        self._refresh_sampler()
 
     def sample(self, sample_idxs: Optional[NDArray] = None) -> Batch:
         if sample_idxs is None:
@@ -355,8 +363,7 @@ class TorchGeometricBuffer(TorchUniformBuffer):
         # sample() issued after load() but before the next add() (e.g. a resumed run that
         # updates before collecting) maps recency to the correct ring window.
         super().load(path)
-        self.sampler.size = self._num_in_buffer
-        self.sampler.Z = self.sampler.compute_Z(self._num_in_buffer)
+        self._refresh_sampler()
 
 
 class MemoryEfficientTorchUniformBuffer(TorchUniformBuffer):
@@ -531,3 +538,22 @@ class MemoryEfficientTorchUniformBuffer(TorchUniformBuffer):
             dataset.get("timeout_next_observations", {}),
         )
         self._n_step_transitions.clear()
+
+
+class MemoryEfficientTorchGeometricBuffer(TorchGeometricBuffer, MemoryEfficientTorchUniformBuffer):
+    """
+    Truncated-Geometric ("GEOM") sampling over the memory-efficient storage layout.
+
+    MRO: TorchGeometricBuffer contributes the recency sampler and its super() calls
+    resolve to MemoryEfficientTorchUniformBuffer, which contributes storage, add and
+    next-observation reconstruction. The only geometric-specific change is the sampler
+    window: the newest n_step * add_batch_size slots are excluded because their future
+    observation slots have not been written yet (same exclusion as the uniform
+    memory-efficient buffer). Recency 0 stays anchored at the oldest entry, so the
+    recency -> ring-index mapping in TorchGeometricBuffer.sample is unchanged.
+    """
+
+    def _geom_window(self) -> int:
+        if self._add_batch_size is None:
+            return 0
+        return max(0, self._num_in_buffer - self._n_step * self._add_batch_size)
