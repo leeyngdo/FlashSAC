@@ -85,7 +85,10 @@ class FlashSACConfig:
     buffer_obs_dtype: Optional[str] = None
     buffer_optimize_memory_usage: bool = True
 
-    # SAPG (Split and Aggregate Policy Gradients): multi-policy diverse exploration on top of SAC.
+    # SAPG-style multi-policy diverse exploration on top of SAC ("Split" only; the paper's
+    # IS-based "Aggregate" is unnecessary off-policy — the replay buffer aggregates, and the
+    # shared critic is trained on every block's data with leader-policy Bellman targets).
+    # Actor: per-block latent conditioning; critic: block-unconditioned (the leader's soft Q).
     # When disabled, the agent is exactly vanilla SAC (single policy, no per-agent latent).
     sapg_enabled: bool = False
     sapg_num_agents: int = 1
@@ -98,6 +101,14 @@ class FlashSACConfig:
     # mod M) targets `temp_target_entropy + r * sapg_target_entropy_grading` nats. Positive
     # values push followers toward higher-entropy, more exploratory policies. 0 disables.
     sapg_target_entropy_grading: float = 0.0
+    # Alternative per-block diversity spec: an explicit per-block target sigma list (length
+    # sapg_num_agents, indexed by agent id; the SAC analogue of original SAPG's ir-coef-scale
+    # grid). Each block's target entropy is computed from its sigma exactly like
+    # temp_target_sigma. Mutually exclusive with sapg_target_entropy_grading.
+    sapg_target_sigmas: Optional[tuple[float, ...]] = None
+    # Compute reward-normalizer return statistics from the leader block's envs only, so the
+    # scale is not dragged by high-entropy follower blocks. Requires sapg_enabled.
+    sapg_reward_norm_leader_only: bool = False
 
     # Recency-biased ("GEOM" / truncated-geometric) replay sampling. buffer_geom_alpha biases
     # the global sample() distribution toward recent transitions (0 => exact uniform legacy
@@ -159,7 +170,8 @@ def _init_flashsac_networks(
     if cfg.use_compile:
         actor.network.get_mean_and_std = torch.compile(actor.network.get_mean_and_std, mode=cfg.compile_mode)  # type: ignore
 
-    # Initialize critic
+    # Initialize critic (block-unconditioned under SAPG: one shared Q trained on all
+    # blocks' data with leader-policy targets)
     critic_net = FlashSACDoubleCritic(
         num_blocks=cfg.critic_num_blocks,
         input_dim=critic_observation_dim + action_dim,
@@ -167,8 +179,6 @@ def _init_flashsac_networks(
         num_bins=cfg.critic_num_bins,
         min_v=cfg.critic_min_v,
         max_v=cfg.critic_max_v,
-        num_agents=num_agents,
-        agent_latent_dim=agent_latent_dim,
     ).to(device)
 
     critic_optimizer = optim.Adam(
@@ -197,8 +207,6 @@ def _init_flashsac_networks(
         num_bins=cfg.critic_num_bins,
         min_v=cfg.critic_min_v,
         max_v=cfg.critic_max_v,
-        num_agents=num_agents,
-        agent_latent_dim=agent_latent_dim,
     ).to(device)
     target_critic_net.load_state_dict(critic_net.state_dict())
     target_critic = Network(
@@ -360,6 +368,8 @@ def _update_networks(
         device=device,
         use_amp=cfg.use_amp,
         grad_scaler=grad_scaler,
+        num_agents=(cfg.sapg_num_agents if cfg.sapg_enabled else 1),
+        leader_id=cfg.sapg_leader_id,
     )
 
     target_critic_info = update_target_network(
@@ -421,10 +431,14 @@ class FlashSACAgent(BaseAgent[FlashSACConfig]):
             raise ValueError("FlashSAC received an action space with high < low.")
         self._action_bias = 0.5 * (action_high + action_low)
 
+        log_action_range = torch.log(torch.clamp(self._action_range.abs(), min=1e-6)).sum().item()
+
+        def _target_entropy_for_sigma(sigma: float) -> float:
+            """Gaussian(sigma)-matched target entropy in the (scaled) action space."""
+            return 0.5 * self._action_dim * math.log(2 * math.pi * math.e * sigma**2) + log_action_range
+
         if cfg.temp_target_entropy is None:
-            base_target_entropy = 0.5 * self._action_dim * math.log(2 * math.pi * math.e * cfg.temp_target_sigma**2)
-            log_action_range = torch.log(torch.clamp(self._action_range.abs(), min=1e-6)).sum().item()
-            temp_target_entropy = base_target_entropy + log_action_range
+            temp_target_entropy = _target_entropy_for_sigma(cfg.temp_target_sigma)
         else:
             temp_target_entropy = cfg.temp_target_entropy
         compile_mode = _resolve_compile_mode(cfg.compile_mode)
@@ -443,13 +457,10 @@ class FlashSACAgent(BaseAgent[FlashSACConfig]):
                 raise ValueError(f"sapg_num_agents must be >= 2 when SAPG is enabled, got {cfg.sapg_num_agents}.")
             if cfg.sapg_agent_latent_dim <= 0:
                 raise ValueError(
-                    "sapg_agent_latent_dim must be > 0 when SAPG is enabled, "
-                    f"got {cfg.sapg_agent_latent_dim}."
+                    f"sapg_agent_latent_dim must be > 0 when SAPG is enabled, got {cfg.sapg_agent_latent_dim}."
                 )
             if not 0 <= cfg.sapg_leader_id < cfg.sapg_num_agents:
-                raise ValueError(
-                    f"sapg_leader_id must be in [0, {cfg.sapg_num_agents}), got {cfg.sapg_leader_id}."
-                )
+                raise ValueError(f"sapg_leader_id must be in [0, {cfg.sapg_num_agents}), got {cfg.sapg_leader_id}.")
             if cfg.sapg_off_policy_ratio < 0:
                 raise ValueError(f"sapg_off_policy_ratio must be >= 0, got {cfg.sapg_off_policy_ratio}.")
             if cfg.sapg_geom_alphas is not None and len(cfg.sapg_geom_alphas) != cfg.sapg_num_agents:
@@ -457,19 +468,45 @@ class FlashSACAgent(BaseAgent[FlashSACConfig]):
                     f"sapg_geom_alphas must have length sapg_num_agents={cfg.sapg_num_agents}, "
                     f"got {len(cfg.sapg_geom_alphas)}."
                 )
-        elif cfg.sapg_geom_alphas is not None:
-            raise ValueError("sapg_geom_alphas requires sapg_enabled=true.")
+            if cfg.sapg_target_sigmas is not None:
+                if len(cfg.sapg_target_sigmas) != cfg.sapg_num_agents:
+                    raise ValueError(
+                        f"sapg_target_sigmas must have length sapg_num_agents={cfg.sapg_num_agents}, "
+                        f"got {len(cfg.sapg_target_sigmas)}."
+                    )
+                if any(sigma <= 0.0 for sigma in cfg.sapg_target_sigmas):
+                    raise ValueError(f"sapg_target_sigmas must be positive, got {cfg.sapg_target_sigmas}.")
+                if cfg.sapg_target_entropy_grading != 0.0:
+                    raise ValueError(
+                        "sapg_target_sigmas and sapg_target_entropy_grading are mutually exclusive; set one."
+                    )
+        else:
+            if cfg.sapg_geom_alphas is not None:
+                raise ValueError("sapg_geom_alphas requires sapg_enabled=true.")
+            if cfg.sapg_target_sigmas is not None:
+                raise ValueError("sapg_target_sigmas requires sapg_enabled=true.")
+            if cfg.sapg_reward_norm_leader_only:
+                raise ValueError("sapg_reward_norm_leader_only requires sapg_enabled=true.")
         self._sapg_num_agents = cfg.sapg_num_agents if cfg.sapg_enabled else 1
         self._sapg_agent_latent_dim = cfg.sapg_agent_latent_dim if cfg.sapg_enabled else 0
         self._sapg_leader_id = cfg.sapg_leader_id
-        # Per-agent target-entropy offsets for the temperature update: leader (cyclic rank 0)
-        # keeps the base target, follower at rank r gets `+ r * sapg_target_entropy_grading`.
-        # None when disabled -> update_temperature behaves exactly as before.
-        if cfg.sapg_enabled and cfg.sapg_target_entropy_grading != 0.0:
+        # Per-agent target-entropy offsets for the temperature update, from either an explicit
+        # per-block sigma list or additive grading (leader keeps the base target, follower at
+        # cyclic rank r gets `+ r * grading`). None when disabled -> update_temperature behaves
+        # exactly as before.
+        if cfg.sapg_enabled and cfg.sapg_target_sigmas is not None:
+            per_block_targets = torch.tensor(
+                [_target_entropy_for_sigma(float(sigma)) for sigma in cfg.sapg_target_sigmas],
+                dtype=torch.float32,
+            )
+            self._sapg_target_entropy_offsets: Optional[torch.Tensor] = (per_block_targets - temp_target_entropy).to(
+                self._device
+            )
+        elif cfg.sapg_enabled and cfg.sapg_target_entropy_grading != 0.0:
             ranks = (torch.arange(cfg.sapg_num_agents) - cfg.sapg_leader_id) % cfg.sapg_num_agents
-            self._sapg_target_entropy_offsets: Optional[torch.Tensor] = (
-                cfg.sapg_target_entropy_grading * ranks.to(torch.float32)
-            ).to(self._device)
+            self._sapg_target_entropy_offsets = (cfg.sapg_target_entropy_grading * ranks.to(torch.float32)).to(
+                self._device
+            )
         else:
             self._sapg_target_entropy_offsets = None
 
@@ -609,11 +646,18 @@ class FlashSACAgent(BaseAgent[FlashSACConfig]):
         # update reward normalizer
         if self._cfg.normalize_reward:
             assert "reward" in transition and self.reward_normalizer is not None
-            self.reward_normalizer.update_reward_stats(
-                reward=torch.as_tensor(transition["reward"], device=self._device),
-                terminated=torch.as_tensor(transition["terminated"], device=self._device),
-                truncated=torch.as_tensor(transition["truncated"], device=self._device),
-            )
+            reward = torch.as_tensor(transition["reward"], device=self._device)
+            terminated = torch.as_tensor(transition["terminated"], device=self._device)
+            truncated = torch.as_tensor(transition["truncated"], device=self._device)
+            if self._cfg.sapg_reward_norm_leader_only:
+                # Follower blocks run hotter (graded entropy targets) and have different
+                # return distributions; anchor the normalization scale to the leader's envs.
+                block_size = reward.shape[0] // self._sapg_num_agents
+                leader_rows = slice(self._sapg_leader_id * block_size, (self._sapg_leader_id + 1) * block_size)
+                reward = reward[leader_rows]
+                terminated = terminated[leader_rows]
+                truncated = truncated[leader_rows]
+            self.reward_normalizer.update_reward_stats(reward=reward, terminated=terminated, truncated=truncated)
 
     def can_start_training(self) -> bool:
         return self._replay_buffer.can_sample()

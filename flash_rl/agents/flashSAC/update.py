@@ -122,7 +122,6 @@ def update_actor(
             observations=batch["observation"],
             actions=actions,
             training=False,
-            agent_ids=agent_ids,
         )
         q = torch.minimum(qs[0], qs[1])
         critic.network.requires_grad_(True)
@@ -203,6 +202,8 @@ def update_critic(
     device: torch.device,
     use_amp: bool,
     grad_scaler: Optional[GradScaler],
+    num_agents: int = 1,
+    leader_id: int = 0,
 ) -> dict[str, torch.Tensor]:
     """Update critic network.
 
@@ -220,30 +221,36 @@ def update_critic(
         device: Device to use.
         use_amp: Whether to use automatic mixed precision.
         grad_scaler: GradScaler for FP16 AMP.
+        num_agents: Number of SAPG blocks (1 disables SAPG handling).
+        leader_id: SAPG leader block id; Bellman targets use this policy.
     """
 
     with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
         # Compute target values
         with torch.no_grad():
-            # SAPG: condition the (target) critic and next-action policy on the policy id selected
-            # by the sampler. Followers only receive their own collected rows; the leader receives
-            # globally sampled rows retagged with the leader id.
+            # SAPG: the shared critic is the LEADER's soft Q. Bellman targets sample a' and
+            # the entropy bonus from the leader policy (latent z_leader, temperature
+            # alpha_leader) for every row, so all blocks' transitions train the leader's Q
+            # — the aggregation half of SAPG, without importance sampling.
             agent_ids = cast(Optional[torch.Tensor], batch.get("agent_id"))
+            if num_agents > 1 and agent_ids is not None:
+                target_ids: Optional[torch.Tensor] = torch.full_like(agent_ids, leader_id)
+            else:
+                target_ids = agent_ids
             next_actions, info = actor(
                 observations=batch["actor_next_observation"],
                 training=False,
-                agent_ids=agent_ids,
+                agent_ids=target_ids,
             )
             # Clone variables to prevent overwriting
             next_actions = next_actions.clone()
             next_actor_log_probs = info["log_prob"].clone()
 
-            temp_value = temperature(agent_ids) if agent_ids is not None else temperature()
+            temp_value = temperature(target_ids) if target_ids is not None else temperature()
 
             next_actor_entropy = temp_value * next_actor_log_probs
             obs_all = torch.cat([batch["observation"], batch["next_observation"]], dim=0)  # type: ignore
             act_all = torch.cat([batch["action"], next_actions], dim=0)  # type: ignore
-            ids_all = torch.cat([agent_ids, agent_ids], dim=0) if agent_ids is not None else None
 
             # qs_all: (2, 2*B)
             # q_infos_all['log_probs']: (2, 2*B, num_bins)
@@ -251,7 +258,6 @@ def update_critic(
                 observations=obs_all,
                 actions=act_all,
                 training=True,
-                agent_ids=ids_all,
             )
             next_qs = qs_all.chunk(2, dim=1)[1]
             next_q_log_probs = q_infos_all["log_prob"].chunk(2, dim=1)[1]
@@ -275,7 +281,6 @@ def update_critic(
             observations=obs_all,
             actions=act_all,
             training=True,
-            agent_ids=ids_all,
         )
         pred_log_probs = torch.chunk(pred_q_infos["log_prob"], 2, dim=1)[0]
 

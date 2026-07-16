@@ -58,7 +58,10 @@ load_optimizer: true
 load_reward_normalizer: true
 
 ##################################################################################
-# SAPG (Split and Aggregate Policy Gradients) - multi-policy diverse exploration
+# SAPG-style multi-policy diverse exploration ("Split" only). The actor is conditioned on a
+# per-block latent; the critic is block-UNconditioned and trained on every block's data with
+# leader-policy Bellman targets (SAC's replay buffer already aggregates, so the paper's
+# IS-based off-policy loss is not ported). Eval/deploy always uses the leader block.
 # sapg_enabled=false => vanilla SAC. Requires num_train_envs % sapg_num_agents == 0.
 ##################################################################################
 sapg_enabled: false
@@ -70,6 +73,14 @@ sapg_off_policy_ratio: 1
 # (r = (agent_id - leader_id) mod M) targets `temp_target_entropy + r * grading` nats; the
 # leader keeps the base target. 0 disables.
 sapg_target_entropy_grading: 0.0
+# Alternative diversity spec: explicit per-block target sigmas (length sapg_num_agents,
+# indexed by agent id; log-spaced grids like [0.1, 0.15, 0.25, 0.4] mirror original SAPG's
+# ir-coef-scale sweep). Each block's target entropy is derived from its sigma exactly like
+# temp_target_sigma. Mutually exclusive with sapg_target_entropy_grading. null disables.
+sapg_target_sigmas: null
+# Compute reward-normalizer return statistics from the leader block's envs only, so the
+# scale is not dragged by high-entropy follower blocks.
+sapg_reward_norm_leader_only: false
 # Recency-biased (truncated-geometric / "GEOM") replay sampling. buffer_geom_alpha biases the
 # global sample() toward recent data (0 => exact uniform legacy behavior; mean sample age
 # ~ capacity/(alpha*ln2)). sapg_geom_alphas: optional per-agent alphas for SAPG block sampling
