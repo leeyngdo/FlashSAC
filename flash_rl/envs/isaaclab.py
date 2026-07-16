@@ -11,6 +11,7 @@ from gymnasium.vector.utils import batch_space
 
 from ..types import F32NDArray, NDArray
 from .isaaclab_envs.dexsuite.overrides import apply_dexsuite_overrides
+from .isaaclab_envs.simtoolreal.overrides import apply_simtoolreal_overrides
 from .isaaclab_envs.tracking.overrides import apply_tracking_overrides, omegaconf_to_plain
 from .isaaclab_envs.utils.action_bounds import compute_joint_limit_action_bound
 
@@ -32,6 +33,7 @@ ACTION_BOUNDS = {
     "Isaac-Tracking-Flat-G1-v0": 1.0,
     "Isaac-Tracking-Flat-G1-WoSE-v0": 1.0,
     "Isaac-Dexsuite-Kuka-Allegro-Reorient-v0": 1.0,
+    "Isaac-SimToolReal-Kuka-Sharpa-Direct-v0": 1.0,
 }
 
 # NOTE: Local IsaacLab tasks must be imported after AppLauncher starts IsaacSim and before parse_env_cfg.
@@ -41,6 +43,10 @@ LOCAL_ISAACLAB_TASKS: dict[str, tuple[str, Callable[..., Any] | None]] = {
     "Isaac-Dexsuite-Kuka-Allegro-Reorient-v0": (
         "flash_rl.envs.isaaclab_envs.dexsuite.config.kuka_allegro",
         apply_dexsuite_overrides,
+    ),
+    "Isaac-SimToolReal-Kuka-Sharpa-Direct-v0": (
+        "flash_rl.envs.isaaclab_envs.simtoolreal.config.kuka_sharpa",
+        apply_simtoolreal_overrides,
     ),
 }
 
@@ -324,6 +330,12 @@ class IsaacLabVectorEnv(
             infos["final_obs"] = self._assemble_obs(self._final_obs_buf)
         else:
             infos["final_obs"] = obs
+
+        # Surface a per-env success signal for evaluate() from envs that publish an
+        # extras["episode_final"]["successes"] counter (written before done envs reset).
+        episode_final = raw_infos.get("episode_final") if isinstance(raw_infos, dict) else None
+        if isinstance(episode_final, dict) and "successes" in episode_final:
+            infos["success"] = episode_final["successes"] > 0
 
         log = raw_infos.get("log") if isinstance(raw_infos, dict) else None
         if log and (bool(terminations.any()) or bool(truncations.any())):
