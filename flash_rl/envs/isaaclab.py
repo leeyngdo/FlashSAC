@@ -19,6 +19,7 @@ from .isaaclab_envs.utils.action_bounds import compute_joint_limit_action_bound
 ACTION_BOUNDS = {
     "Isaac-Repose-Cube-Shadow-Direct-v0": 1.0,
     "Isaac-Repose-Cube-Allegro-Direct-v0": 1.0,
+    "Isaac-Dexsuite-Kuka-Allegro-Lift-v0": 1.0,
     "Isaac-Velocity-Flat-G1-v0": 1.0,
     "Isaac-Velocity-Rough-G1-v0": 1.0,
     "Isaac-Velocity-Flat-H1-v0": 1.0,
@@ -97,6 +98,7 @@ class IsaacLabVectorEnv(
         motion: dict[str, Any] | None = None,
         cfg_overrides: dict[str, Any] | None = None,
         action_bound: dict[str, Any] | None = None,
+        obs_groups: list[str] | None = None,
         distributed: bool = False,
     ):
         from isaaclab.app import AppLauncher
@@ -152,25 +154,50 @@ class IsaacLabVectorEnv(
         self.num_envs = cast(Any, self.envs.unwrapped).num_envs
         self.max_episode_steps = cast(Any, self.envs.unwrapped).max_episode_length
         self.to_numpy = to_numpy
+        # When set, the agent observation is the concatenation of exactly these observation
+        # groups (e.g. ["policy", "proprio"] for dexsuite, which has no "critic" group).
+        # When None, fall back to the policy (+ optional critic) layout.
+        self._obs_groups = list(obs_groups) if obs_groups is not None else None
+
+        # Boolean success signal for evaluate(): derived from a pose command term's
+        # position_error/orientation_error metrics (dexsuite-style). Thresholds mirror the
+        # task's own success visualization (pose_commands.py: pos < 0.05 m, rot < 0.5 rad).
+        # Resolved lazily on the first step; None when the task has no such command term,
+        # in which case infos carries no "success" key and eval success stays unreported.
+        self._success_pos_threshold = 0.05
+        self._success_rot_threshold = 0.5
+        self._success_term: Any = None
+        self._success_term_resolved = False
 
         # Get observation/action spaces
         # NOTE: Action range: [-1, 1] * action_bounds (https://github.com/google-deepmind/mujoco_playground/issues/19)
         obs_space = cast(Any, self.envs.unwrapped).single_observation_space
-        self.obs_size = obs_space["policy"].shape
-        self.asymmetric_obs = isinstance(obs_space, gym.spaces.Dict) and "critic" in obs_space.spaces
-        if self.asymmetric_obs:
-            # NOTE: Env will treat concatenate actor & critic states as the observation,
-            # but will give 'actual' observation size in the info.
-            self.critic_obs_size = obs_space["critic"].shape
-            # NOTE: setting to [0, 0] since we only need the shape and dtype
-            self.single_observation_space = gym.spaces.Box(
-                low=0.0, high=0.0, shape=(self.obs_size[-1] + self.critic_obs_size[-1],), dtype=np.float32
-            )
+        if self._obs_groups is not None:
+            missing = [g for g in self._obs_groups if g not in obs_space.spaces]
+            if missing:
+                raise KeyError(f"obs_groups {missing} not in env observation groups {list(obs_space.spaces)}")
+            total_dim = sum(int(obs_space[g].shape[-1]) for g in self._obs_groups)
+            self.obs_size = (total_dim,)
+            self.asymmetric_obs = False
+            self.critic_obs_size = 0
+            self.single_observation_space = gym.spaces.Box(low=0.0, high=0.0, shape=(total_dim,), dtype=np.float32)
             self.observation_space = batch_space(self.single_observation_space, self.num_envs)
         else:
-            self.critic_obs_size = 0
-            self.single_observation_space = gym.spaces.Box(low=0.0, high=0.0, shape=self.obs_size, dtype=np.float32)
-            self.observation_space = batch_space(self.single_observation_space, self.num_envs)
+            self.obs_size = obs_space["policy"].shape
+            self.asymmetric_obs = isinstance(obs_space, gym.spaces.Dict) and "critic" in obs_space.spaces
+            if self.asymmetric_obs:
+                # NOTE: Env will treat concatenate actor & critic states as the observation,
+                # but will give 'actual' observation size in the info.
+                self.critic_obs_size = obs_space["critic"].shape
+                # NOTE: setting to [0, 0] since we only need the shape and dtype
+                self.single_observation_space = gym.spaces.Box(
+                    low=0.0, high=0.0, shape=(self.obs_size[-1] + self.critic_obs_size[-1],), dtype=np.float32
+                )
+                self.observation_space = batch_space(self.single_observation_space, self.num_envs)
+            else:
+                self.critic_obs_size = 0
+                self.single_observation_space = gym.spaces.Box(low=0.0, high=0.0, shape=self.obs_size, dtype=np.float32)
+                self.observation_space = batch_space(self.single_observation_space, self.num_envs)
 
         self.action_size = cast(Any, self.envs.unwrapped).single_action_space.shape
         self._action_low = torch.full(self.action_size, -float(action_bounds), device=self.device)
@@ -239,6 +266,21 @@ class IsaacLabVectorEnv(
         bias, rng = compute_joint_limit_action_bound(soft, default, scale, fraction=fraction)
         return bias.to(self.device).float(), rng.to(self.device).float()
 
+    def _assemble_obs(self, obs_dict: dict[str, torch.Tensor]) -> torch.Tensor:
+        """Assemble the agent observation from the env's observation-group dict.
+
+        When ``obs_groups`` is configured, concatenate exactly those groups (used by
+        multi-group tasks like dexsuite that split obs into policy/proprio/perception and
+        expose no ``critic`` group). Otherwise use the policy (+ optional critic) layout
+        of the Direct / locomotion tasks.
+        """
+        if self._obs_groups is not None:
+            return torch.cat([obs_dict[g] for g in self._obs_groups], dim=-1)
+        obs = obs_dict["policy"]
+        if self.asymmetric_obs:
+            obs = torch.cat((obs, obs_dict["critic"]), dim=-1)
+        return obs
+
     def reset(
         self,
         *,
@@ -247,12 +289,7 @@ class IsaacLabVectorEnv(
         random_start_init: bool = True,
     ) -> tuple[Union[torch.Tensor, F32NDArray], dict[str, Any]]:
         obs_dict, infos = self.envs.reset()
-        obs = obs_dict["policy"]
-        if self.asymmetric_obs:
-            critic_obs = obs_dict["critic"]
-            obs = torch.cat((obs, critic_obs), dim=-1)
-        else:
-            critic_obs = None
+        obs = self._assemble_obs(obs_dict)
         # NOTE: decorrelate episode horizons like RSL‑RL
         # In IsaacLab, `dones` is computed as follows:
         # `time_out = self.episode_length_buf >= self.max_episode_length - 1`
@@ -283,21 +320,14 @@ class IsaacLabVectorEnv(
 
         torch_actions = torch.clamp(torch_actions, self._action_low, self._action_high)
         obs_dict, rew, terminations, truncations, raw_infos = cast(Any, self.envs.step(torch_actions))
-        obs = obs_dict["policy"]
-        if self.asymmetric_obs:
-            critic_obs = obs_dict["critic"]
-            obs = torch.cat((obs, critic_obs), dim=-1)
-        else:
-            critic_obs = None
+        obs = self._assemble_obs(obs_dict)
+        critic_obs = obs_dict["critic"] if (self._obs_groups is None and self.asymmetric_obs) else None
         infos = {"time_outs": truncations, "observations": {"critic": critic_obs}}
         # NOTE: There's really no way to get the raw observations from IsaacLab
         # We just use the 'reset_obs' as next_obs, unfortunately.
         # See https://github.com/isaac-sim/IsaacLab/issues/1362
         if self._final_obs_buf is not None:
-            final_obs = self._final_obs_buf["policy"]
-            if self.asymmetric_obs:
-                final_obs = torch.cat((final_obs, self._final_obs_buf["critic"]), dim=-1)
-            infos["final_obs"] = final_obs
+            infos["final_obs"] = self._assemble_obs(self._final_obs_buf)
         else:
             infos["final_obs"] = obs
 
@@ -315,6 +345,10 @@ class IsaacLabVectorEnv(
             if episode_info:
                 infos["episode_info"] = episode_info
 
+        success = self._compute_success()
+        if success is not None:
+            infos["success"] = success
+
         if self.to_numpy:
             obs = obs.cpu().numpy()
             rew = rew.cpu().numpy()
@@ -322,6 +356,30 @@ class IsaacLabVectorEnv(
             truncations = truncations.cpu().numpy()
             infos = cast(dict[str, Any], recursive_to_numpy(infos))
         return obs, rew, terminations, truncations, infos
+
+    def _compute_success(self) -> torch.Tensor | None:
+        """Per-env boolean success from the task's pose command metrics (None when unavailable).
+
+        Matches the dexsuite success criterion: position_error < 0.05 m AND
+        orientation_error < 0.5 rad against the commanded pose. Requires BOTH metrics on the
+        command term so unrelated tasks (whose metrics mean something else) are not
+        misreported.
+        """
+        if not self._success_term_resolved:
+            self._success_term_resolved = True
+            command_manager = getattr(self.envs.unwrapped, "command_manager", None)
+            if command_manager is not None:
+                for name in getattr(command_manager, "active_terms", []):
+                    metrics = getattr(command_manager.get_term(name), "metrics", None)
+                    if metrics and "position_error" in metrics and "orientation_error" in metrics:
+                        self._success_term = command_manager.get_term(name)
+                        break
+        if self._success_term is None:
+            return None
+        metrics = self._success_term.metrics
+        return (metrics["position_error"] < self._success_pos_threshold) & (
+            metrics["orientation_error"] < self._success_rot_threshold
+        )
 
     def close(self, **kwargs: Any) -> None:
         # self.envs.close(**kwargs)
@@ -345,6 +403,7 @@ def make_isaaclab_env(
     motion: dict[str, Any] | None = None,
     cfg_overrides: dict[str, Any] | None = None,
     action_bound: dict[str, Any] | None = None,
+    obs_groups: list[str] | None = None,
 ) -> IsaacLabVectorEnv:
     if env_name not in ACTION_BOUNDS:
         print(f"Action bounds not defined for {env_name}; using default value 1.0.")
@@ -370,6 +429,7 @@ def make_isaaclab_env(
         motion=motion,
         cfg_overrides=cfg_overrides,
         action_bound=action_bound,
+        obs_groups=obs_groups,
         distributed=distributed,
     )
     return env
